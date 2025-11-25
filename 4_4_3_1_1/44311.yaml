@@ -1,0 +1,255 @@
+---
+- name: CIS 4.4.3.1.1 - Ensure password failed attempts lockout is configured (Safe via authselect)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "4.4.3.1.1"
+    control_name: "Ensure password failed attempts lockout is configured"
+    deny_val: 5
+    unlock_time_val: 300
+    fail_interval_val: 900
+    even_deny_root: false         # แนะนำ false เว้นมี OOB/console แน่นหนา
+    cis_enforce: false            # ค่าเริ่มต้น: audit-only (ไม่แก้ระบบ) ; จะบังคับแก้ใส่ -e cis_enforce=true
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Become: {{ ansible_effective_user_id | default('root') }}"
+
+    # --- ตรวจว่า PAM ถูก manage โดย authselect หรือไม่ ---
+    - name: Check authselect state
+      command: authselect current
+      register: authselect_current
+      changed_when: false
+      failed_when: false
+
+    - name: Abort if system not managed by authselect (only when enforcing)
+      when:
+        - cis_enforce | bool
+        - authselect_current.rc != 0
+      fail:
+        msg: "authselect is not managing PAM on this system. Refusing to modify to avoid lockout."
+
+    # --- โหมดบังคับแก้: ขอคอนเฟิร์มก่อน เริ่มจาก backup และแก้แบบปลอดภัย ---
+    - name: Safety prompt before PAM changes
+      when: cis_enforce | bool
+      pause:
+        prompt: "Enable 'with-faillock' & set faillock.conf (deny={{ deny_val }}, unlock_time={{ unlock_time_val }}, fail_interval={{ fail_interval_val }}) — type YES to continue:"
+      register: confirm_pam
+
+    - name: Abort if not confirmed
+      when:
+        - cis_enforce | bool
+        - confirm_pam.user_input != 'YES'
+      fail:
+        msg: "User aborted PAM configuration."
+
+    - name: Backup authselect configuration (safe)
+      when:
+        - cis_enforce | bool
+        - authselect_current.rc == 0
+      command: authselect backup
+      register: authselect_backup
+      changed_when: "'created at' in (authselect_backup.stdout | default(''))"
+      failed_when: false
+
+    # --- แก้เฉพาะ key ใน /etc/security/faillock.conf (ไม่ overwrite ทั้งไฟล์) ---
+    - name: Ensure deny in faillock.conf
+      when: cis_enforce | bool
+      lineinfile:
+        path: /etc/security/faillock.conf
+        regexp: '^\s*deny\s*='
+        line: "deny = {{ deny_val }}"
+        create: yes
+        backup: yes
+
+    - name: Ensure unlock_time in faillock.conf
+      when: cis_enforce | bool
+      lineinfile:
+        path: /etc/security/faillock.conf
+        regexp: '^\s*unlock_time\s*='
+        line: "unlock_time = {{ unlock_time_val }}"
+        create: yes
+        backup: yes
+
+    - name: Ensure fail_interval in faillock.conf
+      when: cis_enforce | bool
+      lineinfile:
+        path: /etc/security/faillock.conf
+        regexp: '^\s*fail_interval\s*='
+        line: "fail_interval = {{ fail_interval_val }}"
+        create: yes
+        backup: yes
+
+    - name: Ensure audit flag in faillock.conf
+      when: cis_enforce | bool
+      lineinfile:
+        path: /etc/security/faillock.conf
+        regexp: '^\s*audit\s*$'
+        line: "audit"
+        create: yes
+        backup: yes
+
+    - name: (Optional) even_deny_root in faillock.conf
+      when:
+        - cis_enforce | bool
+        - even_deny_root | bool
+      lineinfile:
+        path: /etc/security/faillock.conf
+        regexp: '^\s*even_deny_root\s*$'
+        line: "even_deny_root"
+        create: yes
+        backup: yes
+
+    # --- เปิด feature with-faillock ผ่าน authselect (มี validate + rollback) ---
+    - name: Enable with-faillock via authselect (guarded, idempotent) and apply
+      when:
+        - cis_enforce | bool
+        - authselect_current.rc == 0
+      block:
+        - name: Enable feature if missing
+          shell: |
+            set -e
+            if ! authselect current | grep -q 'with-faillock'; then
+              authselect enable-feature with-faillock
+            fi
+          register: enable_with_faillock
+          changed_when: >
+            ('with-faillock' in (enable_with_faillock.stdout | default(''))) or
+            (enable_with_faillock.rc == 0)
+
+        - name: Validate authselect configuration
+          command: authselect check
+          register: authselect_check
+          changed_when: false
+
+        - name: Fail if authselect validation failed
+          when: authselect_check.rc != 0
+          fail:
+            msg: "authselect check failed: {{ authselect_check.stdout | default(authselect_check.stderr) }}"
+
+        - name: Apply authselect changes
+          command: authselect apply-changes
+          register: authselect_apply
+          changed_when: >
+            ('Changes applied.' in (authselect_apply.stdout | default(''))) or
+            (authselect_apply.rc == 0)
+
+      rescue:
+        - name: ROLLBACK - Restore last authselect backup (safe)
+          command: authselect rollback
+          register: authselect_rollback
+          changed_when: >
+            ('rolled back' in (authselect_rollback.stdout | default(''))) or
+            (authselect_rollback.rc == 0)
+          failed_when: false
+
+        - fail:
+            msg: "authselect enable/apply failed; rolled back safely."
+
+    # --- Re-audit: system-auth & password-auth ต้องมี preauth/authfail ---
+    - name: Check preauth in system-auth
+      command: egrep '^auth[[:space:]]+(required|\[default=die\])[[:space:]]+pam_faillock\.so.*preauth' /etc/pam.d/system-auth
+      register: preauth_check_sys
+      changed_when: false
+      failed_when: false
+
+    - name: Check authfail in system-auth
+      command: egrep '^auth[[:space:]]+(required|\[default=die\])[[:space:]]+pam_faillock\.so.*authfail' /etc/pam.d/system-auth
+      register: authfail_check_sys
+      changed_when: false
+      failed_when: false
+
+    - name: Check preauth in password-auth
+      command: egrep '^auth[[:space:]]+(required|\[default=die\])[[:space:]]+pam_faillock\.so.*preauth' /etc/pam.d/password-auth
+      register: preauth_check_pwd
+      changed_when: false
+      failed_when: false
+
+    - name: Check authfail in password-auth
+      command: egrep '^auth[[:space:]]+(required|\[default=die\])[[:space:]]+pam_faillock\.so.*authfail' /etc/pam.d/password-auth
+      register: authfail_check_pwd
+      changed_when: false
+      failed_when: false
+
+    - name: Check deny value in faillock.conf
+      shell: |
+        awk -F= '/^\s*deny\s*=/{gsub(/ /,"",$2);print $2}' /etc/security/faillock.conf
+      register: deny_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check unlock_time value in faillock.conf
+      shell: |
+        awk -F= '/^\s*unlock_time\s*=/{gsub(/ /,"",$2);print $2}' /etc/security/faillock.conf
+      register: unlock_time_check
+      changed_when: false
+      failed_when: false
+
+    - name: Safety | reset faillock for current user (avoid accidental lock during test)
+      command: faillock --user {{ ansible_user_id }} --reset
+      changed_when: false
+      failed_when: false
+
+    # --- Build result -> result_list (ตามฟอร์แมต CSV เดิม) ---
+    - name: Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "authselect with-faillock + faillock.conf (deny={{ deny_val }}, unlock_time={{ unlock_time_val }}, fail_interval={{ fail_interval_val }})"
+          expected: "system/password-auth have pam_faillock preauth+authfail; deny={{ deny_val }}, unlock_time={{ unlock_time_val }}"
+          result: >-
+            preauth_sys={{ preauth_check_sys.rc == 0 }};
+            authfail_sys={{ authfail_check_sys.rc == 0 }};
+            preauth_pwd={{ preauth_check_pwd.rc == 0 }};
+            authfail_pwd={{ authfail_check_pwd.rc == 0 }};
+            deny={{ (deny_check.stdout | default('') | trim) }};
+            unlock_time={{ (unlock_time_check.stdout | default('') | trim) }};
+            authselect_current_rc={{ authselect_current.rc }};
+          status: >-
+            {%
+              if (preauth_check_sys.rc == 0)
+              and (authfail_check_sys.rc == 0)
+              and (preauth_check_pwd.rc == 0)
+              and (authfail_check_pwd.rc == 0)
+              and (deny_check.stdout | trim == deny_val | string)
+              and (unlock_time_check.stdout | trim == unlock_time_val | string)
+            -%}
+              Pass
+            {%- else -%}
+              Fail
+            {%- endif %}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+# ===== CSV Reporting (เหมือนสไตล์เดิม) =====
+- name: Export CIS 4.4.3.1.1 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | replace(',', ';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_4_4_3_1_1_report.csv"

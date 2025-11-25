@@ -1,0 +1,149 @@
+---
+- name: CIS 1.1.2.6.2 - Ensure nodev option set on /var/log partition
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    ctrl_id: "1.1.2.6.2"
+    ctrl_name: "Ensure nodev option set on /var/log partition"
+
+  tasks:
+    - name: "{{ ctrl_id }} - Check if /var/log is a mount point"
+      command: mountpoint -q /var/log
+      register: is_varlog_mounted
+      ignore_errors: true
+      changed_when: false
+
+    - name: "{{ ctrl_id }} - Get runtime SOURCE for /var/log"
+      command: findmnt -nro SOURCE /var/log
+      register: varlog_src
+      when: is_varlog_mounted.rc == 0
+      changed_when: false
+
+    - name: "{{ ctrl_id }} - Get runtime FSTYPE for /var/log"
+      command: findmnt -nro FSTYPE /var/log
+      register: varlog_fstype
+      when: is_varlog_mounted.rc == 0
+      changed_when: false
+
+    - name: "{{ ctrl_id }} - Get runtime OPTIONS for /var/log"
+      command: findmnt -nro OPTIONS /var/log
+      register: varlog_opts_runtime
+      when: is_varlog_mounted.rc == 0
+      changed_when: false
+
+    - name: "{{ ctrl_id }} - Build desired options (preserve existing + add nodev)"
+      set_fact:
+        desired_opts_list: >-
+          {{
+            ( (varlog_opts_runtime.stdout | default('defaults')) | split(',') )
+            | reject('equalto','')
+            | list
+            | union(['nodev'])
+            | unique
+          }}
+      when: is_varlog_mounted.rc == 0
+
+    - name: "{{ ctrl_id }} - Join desired options"
+      set_fact:
+        desired_opts: "{{ desired_opts_list | join(',') }}"
+      when: is_varlog_mounted.rc == 0
+
+    # --- fstab update ---
+    - name: "{{ ctrl_id }} - Ensure fstab has nodev on /var/log (update if exists)"
+      lineinfile:
+        path: /etc/fstab
+        backrefs: true
+        regexp: '^(\S+\s+/var/log\s+\S+\s+)(\S+)(\s+\d+\s+\d+)?$'
+        line: '\1{{ desired_opts }} 0 0'
+      when:
+        - is_varlog_mounted.rc == 0
+        - lookup('pipe','grep -E "^[^#]+\\s+/var/log\\s+" /etc/fstab >/dev/null 2>&1; echo $?') | int == 0
+
+    - name: "{{ ctrl_id }} - Ensure fstab entry exists for /var/log (create if missing)"
+      lineinfile:
+        path: /etc/fstab
+        line: "{{ varlog_src.stdout }} /var/log {{ varlog_fstype.stdout }} {{ desired_opts }} 0 0"
+        insertafter: EOF
+      when:
+        - is_varlog_mounted.rc == 0
+        - lookup('pipe','grep -E "^[^#]+\\s+/var/log\\s+" /etc/fstab >/dev/null 2>&1; echo $?') | int != 0
+
+    # --- remount (normal vs bind) ---
+    - name: "{{ ctrl_id }} - Remount /var/log (bind mount case)"
+      command: "mount -o remount,bind,{{ desired_opts }} /var/log"
+      when:
+        - is_varlog_mounted.rc == 0
+        - "'bind' in varlog_opts_runtime.stdout"
+
+    - name: "{{ ctrl_id }} - Remount /var/log (normal mount)"
+      ansible.posix.mount:
+        path: /var/log
+        src: "{{ varlog_src.stdout }}"
+        fstype: "{{ varlog_fstype.stdout }}"
+        opts: "{{ desired_opts }}"
+        state: mounted
+      when:
+        - is_varlog_mounted.rc == 0
+        - "'bind' not in varlog_opts_runtime.stdout"
+
+    # --- post-audit for accurate CSV ---
+    - name: "{{ ctrl_id }} - Recheck mount options after remediation"
+      command: findmnt -nro OPTIONS /var/log
+      register: varlog_opts_after
+      when: is_varlog_mounted.rc == 0
+      changed_when: false
+      failed_when: false
+
+    - name: "{{ ctrl_id }} - Build result for CSV export"
+      set_fact:
+        new_result:
+          control_id: "{{ ctrl_id }}"
+          name: "{{ ctrl_name }}"
+          command: "findmnt -no OPTIONS /var/log"
+          expected: "nodev"
+          result: >-
+            {% if is_varlog_mounted.rc != 0 %}
+              /var/log is not a separate mount point
+            {% else %}
+              {{ (varlog_opts_after.stdout | default(varlog_opts_runtime.stdout | default(''))) }}
+            {% endif %}
+          status: >-
+            {% if is_varlog_mounted.rc != 0 %}
+              Not Applicable
+            {% elif (varlog_opts_after.stdout | default(varlog_opts_runtime.stdout | default(''))) is search('(^|,)nodev(,|$)') %}
+              Pass
+            {% else %}
+              Fail
+            {% endif %}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: "{{ ctrl_id }} - Append result to result_list"
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+- name: Export CIS 1.1.2.6.2 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_1_1_2_6_2_report.csv"

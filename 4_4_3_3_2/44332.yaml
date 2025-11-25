@@ -1,0 +1,157 @@
+---
+- name: CIS 4.4.3.3.2 - Ensure password history is enforced for root (pam_pwhistory remember=5 enforce_for_root)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "4.4.3.3.2"
+    control_name: "Ensure password history is enforced for the root user"
+    remember_val: 5
+    cis_enforce: true  # ค่าเริ่มต้น audit-only; ถ้าจะให้แก้จริงใส่ -e "cis_enforce=true"
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Become: {{ ansible_effective_user_id | default('root') }}"
+
+    - name: Guard | Oracle Linux 8 family only
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+          - ansible_facts['distribution'] in ["OracleLinux", "RedHat", "Rocky", "AlmaLinux"]
+          - (ansible_facts['distribution_major_version'] | int) == 8
+        fail_msg: "Unsupported OS. Expect OracleLinux 8.x family."
+
+    - name: Detect authselect profile (informational)
+      ansible.builtin.shell: authselect current
+      register: authselect_cur
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if using non-custom authselect profile
+      when:
+        - authselect_cur.rc == 0
+        - "'custom/' not in authselect_cur.stdout"
+      debug:
+        msg: "Authselect is managing PAM ({{ authselect_cur.stdout | trim }}). Consider switching to a custom profile for persistent PAM changes."
+
+    # ---------- AUDIT ----------
+    - name: Audit | Check pam_pwhistory in system-auth
+      ansible.builtin.shell: |
+        set -o pipefail
+        [ -f /etc/pam.d/system-auth ] && \
+        grep -E '^password[[:space:]]+requisite[[:space:]]+pam_pwhistory\.so.*remember=' /etc/pam.d/system-auth || true
+      args: { executable: /bin/bash }
+      register: pwh_sys_cur
+      changed_when: false
+      failed_when: false
+
+    - name: Audit | Check pam_pwhistory in password-auth
+      ansible.builtin.shell: |
+        set -o pipefail
+        [ -f /etc/pam.d/password-auth ] && \
+        grep -E '^password[[:space:]]+requisite[[:space:]]+pam_pwhistory\.so.*remember=' /etc/pam.d/password-auth || true
+      args: { executable: /bin/bash }
+      register: pwh_pwd_cur
+      changed_when: false
+      failed_when: false
+
+    # ---------- ENFORCE (optional) ----------
+    # เพิ่ม/แก้บรรทัด pam_pwhistory ให้มี remember={{ remember_val }} enforce_for_root
+    - name: Enforce | Ensure pam_pwhistory line in system-auth
+      when: cis_enforce | bool
+      ansible.builtin.lineinfile:
+        path: /etc/pam.d/system-auth
+        regexp: '^password\s+requisite\s+pam_pwhistory\.so.*$'
+        line: "password    requisite    pam_pwhistory.so remember={{ remember_val }} use_authtok enforce_for_root"
+        backup: true
+        create: false
+
+    - name: Enforce | Ensure pam_pwhistory line in password-auth
+      when: cis_enforce | bool
+      ansible.builtin.lineinfile:
+        path: /etc/pam.d/password-auth
+        regexp: '^password\s+requisite\s+pam_pwhistory\.so.*$'
+        line: "password    requisite    pam_pwhistory.so remember={{ remember_val }} use_authtok enforce_for_root"
+        backup: true
+        create: false
+
+    # ---------- VERIFY ----------
+    - name: Verify | pam_pwhistory remember/enforce_for_root in system-auth
+      ansible.builtin.shell: |
+        set -o pipefail
+        [ -f /etc/pam.d/system-auth ] && \
+        grep -E '^password[[:space:]]+requisite[[:space:]]+pam_pwhistory\.so.*remember={{ remember_val }}.*enforce_for_root' /etc/pam.d/system-auth || true
+      args: { executable: /bin/bash }
+      register: pwh_sys_ok
+      changed_when: false
+      failed_when: false
+
+    - name: Verify | pam_pwhistory remember/enforce_for_root in password-auth
+      ansible.builtin.shell: |
+        set -o pipefail
+        [ -f /etc/pam.d/password-auth ] && \
+        grep -E '^password[[:space:]]+requisite[[:space:]]+pam_pwhistory\.so.*remember={{ remember_val }}.*enforce_for_root' /etc/pam.d/password-auth || true
+      args: { executable: /bin/bash }
+      register: pwh_pwd_ok
+      changed_when: false
+      failed_when: false
+
+    # ---------- RESULT ----------
+    - name: Build result for CSV export (root enforced when both files OK)
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "system-auth & password-auth -> pam_pwhistory.so remember={{ remember_val }} enforce_for_root"
+          expected: "pam_pwhistory.so contains remember={{ remember_val }} enforce_for_root"
+          result: >-
+            sysauth_cur={{ pwh_sys_cur.stdout | default('') | trim }};
+            pwauth_cur={{ pwh_pwd_cur.stdout | default('') | trim }};
+            sysauth_ok={{ (pwh_sys_ok.stdout | default('') | length > 0) | ternary('yes','no') }};
+            pwauth_ok={{ (pwh_pwd_ok.stdout | default('') | length > 0) | ternary('yes','no') }};
+          status: >-
+            {{
+              'Pass'
+              if ( (pwh_sys_ok.stdout | default('') | length > 0)
+                   and (pwh_pwd_ok.stdout | default('') | length > 0) )
+              else 'Fail'
+            }}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+    - name: Add host result list to reporting group
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: cis_report
+        result_list: "{{ result_list }}"
+
+# ===== CSV Reporting =====
+- name: Export CIS 4.4.3.3.2 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results -%}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ (r.result | replace('\n',' ') | replace(',', ';') ) }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_4_4_3_3_2_report.csv"

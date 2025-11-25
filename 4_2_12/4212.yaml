@@ -1,0 +1,76 @@
+---
+- name: CIS 4.2.12 - Ensure sshd LoginGraceTime is configured
+  hosts: all
+  become: true
+  gather_facts: true
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+  tasks:
+    - name: 4.2.12 - Backup sshd_config before modifying
+      ansible.builtin.copy:
+        src: /etc/ssh/sshd_config
+        dest: /etc/ssh/sshd_config.bak
+        remote_src: true
+        backup: yes
+      when: ansible_system == 'Linux'
+
+    - name: 4.2.12 - Set SSH LoginGraceTime
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^LoginGraceTime'
+        line: 'LoginGraceTime 30'
+        validate: '/usr/sbin/sshd -T -f %s'
+        create: yes
+      notify: Restart sshd
+      when: ansible_system == 'Linux'
+
+    - name: 4.2.12 - Read LoginGraceTime from sshd_config
+      command: grep '^LoginGraceTime' /etc/ssh/sshd_config
+      register: sshd_logingracetime
+      changed_when: false
+      failed_when: false
+
+    - name: 4.2.12 - Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "4.2.12"
+          name: "Ensure sshd LoginGraceTime is configured"
+          command: "lineinfile /etc/ssh/sshd_config LoginGraceTime"
+          expected: "LoginGraceTime 30"
+          result: "{{ sshd_logingracetime.stdout | default('Not Found') }}"
+          status: "{{ 'Pass' if 'LoginGraceTime 30' in sshd_logingracetime.stdout else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: 4.2.12 - Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+- name: Export CIS 4.2.12 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_4_2_12_report.csv"

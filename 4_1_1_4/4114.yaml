@@ -1,0 +1,56 @@
+---
+- name: CIS 4.1.1.4 - Ensure permissions on /etc/cron.daily are configured
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: 4.1.1.4 - Set correct permissions on /etc/cron.daily
+      ansible.builtin.file:
+        path: /etc/cron.daily
+        owner: root
+        group: root
+        mode: '0700'
+      register: cron_daily_result
+      when: ansible_system == 'Linux'
+      ignore_errors: true
+
+    - name: 4.1.1.4 - Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "4.1.1.4"
+          name: "Ensure permissions on /etc/cron.daily are configured"
+          command: "chmod 0700 /etc/cron.daily"
+          expected: "root:root, mode 0700"
+          result: "{{ cron_daily_result.msg | default('OK') }}"
+          status: "{{ 'Pass' if not cron_daily_result.failed else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: 4.1.1.4 - Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+- name: Export CIS 4.1.1.4 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_4_1_1_4_report.csv"

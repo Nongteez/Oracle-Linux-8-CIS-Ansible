@@ -1,0 +1,133 @@
+# 144.yaml
+- name: CIS 1.4.4 - Disable core dump storage (systemd-coredump)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "1.4.4"
+    control_name: "Disable core dump storage (systemd-coredump)"
+    core_conf_main: "/etc/systemd/coredump.conf"
+    core_conf_dir:  "/etc/systemd/coredump.conf.d"
+    cis_conf_file:  "/etc/systemd/coredump.conf.d/99-cis-core.conf"
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Effective: {{ ansible_effective_user_id | default('N/A') }}"
+
+    - name: Guard | Oracle Linux 8 family only
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+          - ansible_facts['distribution'] in ["OracleLinux", "RedHat", "Rocky", "AlmaLinux"]
+          - (ansible_facts['distribution_major_version'] | int) == 8
+        fail_msg: "Unsupported OS. Expect OracleLinux 8.x family."
+
+    # ---------- PRE-CHECK ----------
+    - name: 1.4.4 - Pre-check Storage=none in coredump configs
+      shell: |
+        if grep -qE '^[# ]*Storage=none' {{ core_conf_main }} 2>/dev/null; then
+          echo "OK_MAIN"
+        elif grep -qE '^[# ]*Storage=none' {{ core_conf_dir }}/*.conf 2>/dev/null; then
+          echo "OK_DROPIN"
+        else
+          echo "NOT_OK"
+        fi
+      register: coredump_precheck
+      changed_when: false
+      failed_when: false
+
+    - name: 1.4.4 - Set pre-check status fact
+      set_fact:
+        storage_none_ok: "{{ coredump_precheck.stdout in ['OK_MAIN','OK_DROPIN'] }}"
+
+    # ---------- ENFORCE (เฉพาะถ้ายังไม่ถูกตั้ง) ----------
+    - name: 1.4.4 - Ensure coredump config directory exists
+      when: not storage_none_ok
+      ansible.builtin.file:
+        path: "{{ core_conf_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: 1.4.4 - Write Storage=none (override)
+      when: not storage_none_ok
+      ansible.builtin.copy:
+        dest: "{{ cis_conf_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # CIS {{ control_id }} - {{ control_name }}
+          [Coredump]
+          Storage=none
+      notify:
+        - Daemon reload (systemd)
+        - Try restart systemd-coredump (safe)
+
+    # ---------- VERIFY ----------
+    - name: 1.4.4 - Verify Storage=none
+      shell: |
+        conf="$(grep -E '^[# ]*Storage=none' {{ core_conf_main }} {{ core_conf_dir }}/*.conf 2>/dev/null | head -n1 || echo 'Not Found')"
+        echo "conf=${conf}"
+      register: coredump_verify
+      changed_when: false
+      failed_when: false
+
+    # ---------- RESULT ----------
+    - name: 1.4.4 - Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "Set systemd-coredump Storage=none via drop-in"
+          expected: "Storage=none"
+          result: "{{ coredump_verify.stdout | default('Not Found') }}"
+          status: "{{ 'Pass' if 'Storage=none' in coredump_verify.stdout else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ hostvars[inventory_hostname].ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: 1.4.4 - Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+  handlers:
+    # ใช้ try-* เพื่อ “ไม่ล้ม” บนเครื่องที่ไม่มี unit
+    - name: Daemon reload (systemd)
+      ansible.builtin.command: systemctl daemon-reload
+
+    - name: Try restart systemd-coredump (safe)
+      listen: Try restart systemd-coredump (safe)
+      ansible.builtin.shell: |
+        set -e
+        systemctl try-restart systemd-coredump.service 2>/dev/null || true
+        systemctl try-restart systemd-coredump.socket  2>/dev/null || true
+      args:
+        executable: /bin/bash
+
+# ===== CSV Reporting =====
+- name: Export CIS 1.4.4 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results -%}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_1_4_4_report.csv"

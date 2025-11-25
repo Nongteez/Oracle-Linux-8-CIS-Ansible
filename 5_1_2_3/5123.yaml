@@ -1,0 +1,114 @@
+---
+# 5123.yaml
+- name: CIS 5.1.2.3 - Ensure journald compression is enabled
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "5.1.2.3"
+    control_name: "Ensure journald compression is enabled"
+    compress_target: "yes"
+    journald_conf_file: "/etc/systemd/journald.conf"
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Become: {{ ansible_effective_user_id | default('root') }}"
+
+    - name: Guard | Oracle Linux 8 family only
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+          - ansible_facts['distribution'] in ["OracleLinux", "RedHat", "Rocky", "AlmaLinux"]
+          - (ansible_facts['distribution_major_version'] | int) == 8
+        fail_msg: "Unsupported OS. Expect OracleLinux 8.x family."
+
+    # ---------- PRE-CHECK ----------
+    - name: Pre-check Compress setting in journald.conf
+      shell: |
+        if grep -Eq '^Compress={{ compress_target }}' {{ journald_conf_file }}; then
+          echo "OK"
+        else
+          echo "NOT_OK"
+        fi
+      register: compress_precheck
+      changed_when: false
+      failed_when: false
+
+    - name: Set pre-check status fact
+      set_fact:
+        compress_ok: "{{ compress_precheck.stdout == 'OK' }}"
+
+    # ---------- ENFORCE (เฉพาะถ้าไม่ OK) ----------
+    - name: Ensure Compress=yes in journald.conf
+      when: not compress_ok
+      ansible.builtin.lineinfile:
+        path: "{{ journald_conf_file }}"
+        regexp: '^#?Compress='
+        line: 'Compress=yes'
+        state: present
+        create: yes
+      notify: Restart systemd-journald
+
+    # ---------- VERIFY ----------
+    - name: Verify Compress setting in journald.conf
+      shell: |
+        grep -E '^Compress=yes' {{ journald_conf_file }} || true
+      register: compress_verify
+      changed_when: false
+      failed_when: false
+
+    # ---------- RESULT ----------
+    - name: Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "Check & Configure Compress=yes in journald.conf"
+          expected: "Compress=yes"
+          result: "{{ compress_verify.stdout | default('Not Found') }}"
+          status: "{{ 'Pass' if compress_ok or 'Compress=yes' in compress_verify.stdout else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ hostvars[inventory_hostname].ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+    - name: Add host result list to reporting group
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: cis_report
+        result_list: "{{ result_list }}"
+
+  handlers:
+    - name: Restart systemd-journald
+      service:
+        name: systemd-journald
+        state: restarted
+
+# ===== CSV Reporting =====
+- name: Export CIS 5.1.2.3 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results -%}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_5_1_2_3_report.csv"

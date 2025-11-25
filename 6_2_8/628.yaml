@@ -1,0 +1,291 @@
+---
+# CIS 6.2.8 - Ensure root PATH integrity (Oracle/RHEL/Rocky/Alma 8)
+- name: CIS 6.2.8 - Ensure root PATH integrity
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "6.2.8"
+    control_name: "Ensure root PATH integrity"
+
+    # กำหนด PATH ที่ปลอดภัย (ไม่มี '.', ไม่มีช่องว่าง, ไม่มี trailing ':')
+    cis_root_path: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    cis_sudo_secure_path: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+    # อนุญาตให้ปรับ owner/mode เฉพาะ path มาตรฐานเหล่านี้
+    safe_path_whitelist:
+      - /usr/local/sbin
+      - /usr/local/bin
+      - /usr/sbin
+      - /usr/bin
+      - /sbin
+      - /bin
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Effective: {{ ansible_effective_user_id | default('N/A') }}"
+
+    - name: Guard | RedHat-like 8 only
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+          - ansible_facts['distribution'] in ["OracleLinux", "RedHat", "Rocky", "AlmaLinux"]
+          - (ansible_facts['distribution_major_version'] | int) == 8
+        fail_msg: "Unsupported OS. Expect RedHat-family 8.x (Oracle/RHEL/Rocky/Alma)."
+
+    # ---------- REMEDIATE SOURCE (ตั้งค่าต้นทางให้สะอาด) ----------
+    - name: Define safe PATH for root via /etc/profile.d/00-root-path.sh
+      copy:
+        dest: /etc/profile.d/00-root-path.sh
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # CIS 6.2.8 - root PATH hardening
+          if [ "$(id -u)" -eq 0 ]; then
+            PATH="{{ cis_root_path }}"
+            export PATH
+          fi
+
+    - name: Ensure root .bash_profile does not append $HOME/bin (keep hardened PATH)
+      blockinfile:
+        path: /root/.bash_profile
+        create: true
+        owner: root
+        group: root
+        mode: '0644'
+        marker: "# {mark} CIS 6.2.8"
+        block: |
+          # Keep PATH hardened for root (CIS 6.2.8)
+          PATH="{{ cis_root_path }}"
+          export PATH
+      notify: restart_login_note
+
+    - name: Ensure ENV_SUPATH in /etc/login.defs matches safe PATH
+      lineinfile:
+        path: /etc/login.defs
+        regexp: '^ENV_SUPATH\s*='
+        line: "ENV_SUPATH\t{{ cis_root_path }}"
+        state: present
+        backrefs: no
+
+    - name: Ensure sudoers secure_path (validated via visudo)
+      lineinfile:
+        path: /etc/sudoers
+        regexp: '^\s*Defaults\s+secure_path='
+        line: "Defaults    secure_path=\"{{ cis_sudo_secure_path }}\""
+        create: no
+        validate: "/usr/sbin/visudo -cf %s"
+
+    # ---------- AUDIT (อ่าน PATH แบบเดียวกับสคริปต์ CIS) ----------
+    - name: Get root PATH (login shell; same as CIS script)
+      shell: "sudo -Hiu root /usr/bin/env | sed -n 's/^PATH=//p'"
+      register: root_path_env
+      changed_when: false
+
+    - name: Split root PATH into list (keep empties for detecting ::)
+      set_fact:
+        root_path_list_raw: "{{ root_path_env.stdout | default('') }}"
+        root_path_list: "{{ (root_path_env.stdout | default('')).split(':') | list }}"
+
+    - name: "Detect insecure patterns (:: / trailing ':' / '.')"
+      set_fact:
+        path_has_double_colon: "{{ root_path_list_raw | regex_search('::') | bool }}"
+        path_has_trailing_colon: "{{ root_path_list_raw | regex_search(':\\s*$') | bool }}"
+        path_has_dot: "{{ root_path_list_raw | regex_search('(^|:)\\.(?::|$)') | bool }}"
+        path_has_empty_elem: "{{ '' in root_path_list }}"
+
+    - name: Stat each PATH element (follow symlinks like test -d)
+      stat:
+        path: "{{ item }}"
+        follow: true
+      loop: "{{ root_path_list | reject('equalto','') | list }}"
+      register: path_stats
+
+    - name: Init issue lists
+      set_fact:
+        not_dirs: []
+        not_root_owned: []
+        over_permissive: []
+
+    - name: Collect non-directory paths
+      set_fact:
+        not_dirs: "{{ not_dirs + [ item.stat.path ] }}"
+      loop: "{{ path_stats.results }}"
+      when:
+        - item.stat is defined
+        - (item.stat.exists | default(false)) and not (item.stat.isdir | default(false))
+
+    - name: Collect non-root-owned directories (exclude symlinks)
+      set_fact:
+        not_root_owned: "{{ not_root_owned + [ item.stat.path ] }}"
+      loop: "{{ path_stats.results }}"
+      when:
+        - item.stat is defined
+        - (item.stat.isdir | default(false))
+        - item.stat.pw_name is defined
+        - item.stat.pw_name != 'root'
+        - item.stat.islnk is not defined or not item.stat.islnk
+
+    - name: Collect over-permissive directories (>0755) (exclude symlinks)
+      set_fact:
+        over_permissive: "{{ over_permissive + [ item.stat.path ] }}"
+      loop: "{{ path_stats.results }}"
+      when:
+        - item.stat is defined
+        - (item.stat.isdir | default(false))
+        - item.stat.mode is defined
+        - (item.stat.mode | int(base=8)) > 0o755
+        - item.stat.islnk is not defined or not item.stat.islnk
+
+    # ---------- REMEDIATE (เฉพาะ path ที่ whitelist และเป็นไดเรกทอรีแท้) ----------
+    - name: Fix ownership to root where safe and whitelisted (non-symlink dirs only)
+      file:
+        path: "{{ item }}"
+        owner: root
+        group: root
+      loop: "{{ not_root_owned | intersect(safe_path_whitelist) }}"
+      when: item is match('^/')
+
+    - name: Fix permissions to 0755 where safe and whitelisted (non-symlink dirs only)
+      file:
+        path: "{{ item }}"
+        mode: '0755'
+      loop: "{{ over_permissive | intersect(safe_path_whitelist) }}"
+      when: item is match('^/')
+
+    # ---------- RE-AUDIT ----------
+    - name: Re-get root PATH (login shell) after remediation
+      shell: "sudo -Hiu root /usr/bin/env | sed -n 's/^PATH=//p'"
+      register: root_path_env2
+      changed_when: false
+
+    - name: Re-split PATH
+      set_fact:
+        root_path_list_raw2: "{{ root_path_env2.stdout | default('') }}"
+        root_path_list2: "{{ (root_path_env2.stdout | default('')).split(':') | list }}"
+
+    - name: "Re-detect insecure patterns (:: / trailing ':' / '.')"
+      set_fact:
+        path_has_double_colon2: "{{ root_path_list_raw2 | regex_search('::') | bool }}"
+        path_has_trailing_colon2: "{{ root_path_list_raw2 | regex_search(':\\s*$') | bool }}"
+        path_has_dot2: "{{ root_path_list_raw2 | regex_search('(^|:)\\.(?::|$)') | bool }}"
+        path_has_empty_elem2: "{{ '' in root_path_list2 }}"
+
+    - name: Re-stat each PATH element (follow symlinks like test -d)
+      stat:
+        path: "{{ item }}"
+        follow: true
+      loop: "{{ root_path_list2 | reject('equalto','') | list }}"
+      register: path_stats2
+
+    - name: Rebuild issue lists
+      set_fact:
+        not_dirs2: []
+        not_root_owned2: []
+        over_permissive2: []
+
+    - name: Collect non-directory paths (recheck)
+      set_fact:
+        not_dirs2: "{{ not_dirs2 + [ item.stat.path ] }}"
+      loop: "{{ path_stats2.results }}"
+      when:
+        - item.stat is defined
+        - (item.stat.exists | default(false)) and not (item.stat.isdir | default(false))
+
+    - name: Collect non-root-owned directories (recheck, exclude symlinks)
+      set_fact:
+        not_root_owned2: "{{ not_root_owned2 + [ item.stat.path ] }}"
+      loop: "{{ path_stats2.results }}"
+      when:
+        - item.stat is defined
+        - (item.stat.isdir | default(false))
+        - item.stat.pw_name is defined
+        - item.stat.pw_name != 'root'
+        - item.stat.islnk is not defined or not item.stat.islnk
+
+    - name: Collect over-permissive directories (>0755) (recheck, exclude symlinks)
+      set_fact:
+        over_permissive2: "{{ over_permissive2 + [ item.stat.path ] }}"
+      loop: "{{ path_stats2.results }}"
+      when:
+        - item.stat is defined
+        - (item.stat.isdir | default(false))
+        - item.stat.mode is defined
+        - (item.stat.mode | int(base=8)) > 0o755
+        - item.stat.islnk is not defined or not item.stat.islnk
+
+    # ---------- RESULT ----------
+    - name: Build fail reasons list (CIS semantics)
+      set_fact:
+        cis_fail_reasons: >-
+          {{
+            []
+            + (['empty element (::) found'] if path_has_double_colon2 else [])
+            + (['trailing colon found'] if path_has_trailing_colon2 else [])
+            + (['current directory (.) found'] if path_has_dot2 else [])
+            + (['empty element in split PATH found'] if path_has_empty_elem2 else [])
+            + (['non-directory in PATH: ' ~ (not_dirs2 | join(', '))] if not_dirs2|length>0 else [])
+            + (['non-root-owned dirs: ' ~ (not_root_owned2 | join(', '))] if not_root_owned2|length>0 else [])
+            + (['over-permissive dirs (>0755): ' ~ (over_permissive2 | join(', '))] if over_permissive2|length>0 else [])
+          }}
+
+    - name: Decide PASS/FAIL
+      set_fact:
+        pass_now: "{{ (cis_fail_reasons | length) == 0 }}"
+
+    - name: Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "Set safe PATH + ENV_SUPATH + sudo secure_path; audit like CIS"
+          expected: "No ::, no trailing :, no '.', all PATH entries are directories, owner=root, perms ≤0755"
+          result: >-
+            PATH={{ root_path_env2.stdout | default('N/A') }};
+            Issues={{ cis_fail_reasons | join(' | ') if cis_fail_reasons|length>0 else 'None' }}
+          status: "{{ 'Pass' if pass_now else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ hostvars[inventory_hostname].ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+    - name: Add host result list to reporting group
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: cis_report
+        result_list: "{{ result_list }}"
+
+  handlers:
+    - name: restart_login_note
+      debug:
+        msg: "Login shells started AFTER this run will see the hardened PATH."
+
+# ===== CSV Reporting =====
+- name: Export CIS 6.2.8 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results -%}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_6_2_8_report.csv"

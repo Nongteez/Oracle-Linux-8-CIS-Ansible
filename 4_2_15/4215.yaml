@@ -1,0 +1,76 @@
+---
+- name: CIS 4.2.15 - Ensure sshd MaxAuthTries is configured
+  hosts: all
+  become: true
+  gather_facts: true
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+  tasks:
+    - name: 4.2.15 - Backup sshd_config before modifying
+      ansible.builtin.copy:
+        src: /etc/ssh/sshd_config
+        dest: /etc/ssh/sshd_config.bak
+        remote_src: true
+        backup: yes
+      when: ansible_system == 'Linux'
+
+    - name: 4.2.15 - Set MaxAuthTries in sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^MaxAuthTries'
+        line: 'MaxAuthTries 4'
+        validate: '/usr/sbin/sshd -T -f %s'
+        create: yes
+      notify: Restart sshd
+      when: ansible_system == 'Linux'
+
+    - name: 4.2.15 - Read MaxAuthTries from sshd_config
+      command: grep '^MaxAuthTries' /etc/ssh/sshd_config
+      register: sshd_maxauthtries
+      changed_when: false
+      failed_when: false
+
+    - name: 4.2.15 - Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "4.2.15"
+          name: "Ensure sshd MaxAuthTries is configured"
+          command: "lineinfile /etc/ssh/sshd_config MaxAuthTries"
+          expected: "MaxAuthTries 4"
+          result: "{{ sshd_maxauthtries.stdout | default('Not Found') }}"
+          status: "{{ 'Pass' if 'MaxAuthTries 4' in sshd_maxauthtries.stdout else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: 4.2.15 - Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+- name: Export CIS 4.2.15 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_4_2_15_report.csv"

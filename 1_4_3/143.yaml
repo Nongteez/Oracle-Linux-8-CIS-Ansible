@@ -1,0 +1,139 @@
+---
+# 143.yaml
+- name: CIS 1.4.3 - Disable core dump backtraces
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "1.4.3"
+    control_name: "Disable core dump backtraces"
+    coredump_main: "/etc/systemd/coredump.conf"
+    coredump_dir:  "/etc/systemd/coredump.conf.d"
+    cis_dropin:    "/etc/systemd/coredump.conf.d/99-cis.conf"
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Effective: {{ ansible_effective_user_id | default('N/A') }}"
+
+    - name: Guard | Oracle Linux 8 family only
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+          - ansible_facts['distribution'] in ["OracleLinux", "RedHat", "Rocky", "AlmaLinux"]
+          - (ansible_facts['distribution_major_version'] | int) == 8
+        fail_msg: "Unsupported OS. Expect OracleLinux 8.x family."
+
+    # ---------- PRE-CHECK ----------
+    - name: Pre-check ProcessSizeMax=0 in coredump configs
+      shell: |
+        if grep -hq '^[[:space:]]*ProcessSizeMax=0' {{ coredump_main }} {{ coredump_dir }}/*.conf 2>/dev/null; then
+          echo "OK"
+        else
+          echo "NOT_OK"
+        fi
+      register: coredump_precheck
+      changed_when: false
+      failed_when: false
+
+    - name: Set pre-check status fact
+      set_fact:
+        coredump_ok: "{{ coredump_precheck.stdout == 'OK' }}"
+
+    # ---------- ENFORCE ----------
+    - name: Ensure coredump drop-in directory exists
+      when: not coredump_ok
+      ansible.builtin.file:
+        path: "{{ coredump_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Write CIS drop-in for coredump
+      when: not coredump_ok
+      ansible.builtin.copy:
+        dest: "{{ cis_dropin }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Coredump]
+          ProcessSizeMax=0
+      notify:
+        - Systemd daemon-reload
+        - Restart systemd-coredump (best-effort)
+        - Restart systemd-coredump.socket (best-effort)
+
+    # ---------- VERIFY ----------
+    - name: Verify ProcessSizeMax=0 in coredump configs
+      shell: |
+        grep -h '^[[:space:]]*ProcessSizeMax=' {{ coredump_main }} {{ coredump_dir }}/*.conf 2>/dev/null || true
+      register: coredump_verify
+      changed_when: false
+      failed_when: false
+
+    # ---------- RESULT ----------
+    - name: Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "Set [Coredump] ProcessSizeMax=0 via {{ cis_dropin }}"
+          expected: "ProcessSizeMax=0 present in systemd coredump config"
+          result: "{{ coredump_verify.stdout | default('Not Found') }}"
+          status: "{{ 'Pass' if ('ProcessSizeMax=0' in (coredump_verify.stdout | default(''))) else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ hostvars[inventory_hostname].ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+    - name: Add host result list to reporting group
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: cis_report
+        result_list: "{{ result_list }}"
+
+  handlers:
+    - name: Systemd daemon-reload
+      ansible.builtin.command: systemctl daemon-reload
+
+    - name: Restart systemd-coredump (best-effort)
+      ansible.builtin.service:
+        name: systemd-coredump
+        state: restarted
+      failed_when: false
+
+    - name: Restart systemd-coredump.socket (best-effort)
+      ansible.builtin.service:
+        name: systemd-coredump.socket
+        state: restarted
+      failed_when: false
+
+# ===== CSV Reporting =====
+- name: Export CIS 1.4.3 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results -%}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_1_4_3_report.csv"

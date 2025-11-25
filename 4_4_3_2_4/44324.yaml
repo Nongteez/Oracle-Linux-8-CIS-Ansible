@@ -1,0 +1,113 @@
+---
+- name: CIS 4.4.3.2.4 - Ensure password same consecutive characters is configured (maxrepeat)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "4.4.3.2.4"
+    control_name: "Ensure password same consecutive characters is configured (maxrepeat)"
+    maxrepeat_val: 3
+    cis_enforce: true   # ค่าเริ่มต้น audit-only; จะให้แก้จริงใส่ -e "cis_enforce=true"
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Become: {{ ansible_effective_user_id | default('root') }}"
+
+    - name: Guard | Oracle Linux 8 family only
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+          - ansible_facts['distribution'] in ["OracleLinux", "RedHat", "Rocky", "AlmaLinux"]
+          - (ansible_facts['distribution_major_version'] | int) == 8
+        fail_msg: "Unsupported OS. Expect OracleLinux 8.x family."
+
+    # ---------- AUDIT ----------
+    - name: Audit | Read current maxrepeat (normalized)
+      ansible.builtin.shell: |
+        set -o pipefail
+        if [ -f /etc/security/pwquality.conf ]; then
+          awk -F= '/^[[:space:]]*maxrepeat[[:space:]]*=/ && $0 !~ /^[[:space:]]*#/ {
+            gsub(/[[:space:]]/,"",$2); print $2
+          }' /etc/security/pwquality.conf | head -n1
+        fi
+      args: { executable: /bin/bash }
+      register: maxrepeat_current
+      changed_when: false
+      failed_when: false
+
+    # ---------- ENFORCE (optional) ----------
+    - name: Enforce | Set maxrepeat in /etc/security/pwquality.conf
+      when: cis_enforce | bool
+      ansible.builtin.lineinfile:
+        path: /etc/security/pwquality.conf
+        regexp: '^[[:space:]]*#?[[:space:]]*maxrepeat[[:space:]]*='
+        line: "maxrepeat = {{ maxrepeat_val }}"
+        create: true
+        backup: true
+        mode: "0644"
+        insertafter: EOF
+        state: present
+
+    # ---------- VERIFY ----------
+    - name: Verify | maxrepeat equals expected
+      ansible.builtin.shell: |
+        set -o pipefail
+        if [ -f /etc/security/pwquality.conf ]; then
+          grep -E '^[[:space:]]*maxrepeat[[:space:]]*=[[:space:]]*{{ maxrepeat_val }}[[:space:]]*$' /etc/security/pwquality.conf || true
+        fi
+      args: { executable: /bin/bash }
+      register: maxrepeat_verify
+      changed_when: false
+      failed_when: false
+
+    # ---------- RESULT (CSV template เดิม) ----------
+    - name: Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "pwquality.conf -> maxrepeat={{ maxrepeat_val }}"
+          expected: "maxrepeat = {{ maxrepeat_val }}"
+          result: >-
+            current={{ maxrepeat_current.stdout | default('') | trim }};
+            verify_line={{ (maxrepeat_verify.stdout | default('Not Found')) | regex_replace('\n',' ') }};
+          status: "{{ 'Pass' if (maxrepeat_verify.stdout | default('') | length > 0) else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+    - name: Add host result list to reporting group
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: cis_report
+        result_list: "{{ result_list }}"
+
+# ===== CSV Reporting (ตามเทมเพลตก่อนหน้า) =====
+- name: Export CIS 4.4.3.2.4 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | replace(',', ';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_4_4_3_2_4_report.csv"

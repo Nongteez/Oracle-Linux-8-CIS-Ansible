@@ -1,0 +1,101 @@
+---
+# 6211.yaml
+- name: CIS 6.2.11 - Ensure local user dotfiles are secure
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "6.2.11"
+    control_name: "Ensure local user dotfiles are secure"
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Effective: {{ ansible_effective_user_id | default('N/A') }}"
+
+    - name: Guard | Oracle Linux 8 family only
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+          - ansible_facts['distribution'] in ["OracleLinux", "RedHat", "Rocky", "AlmaLinux"]
+          - (ansible_facts['distribution_major_version'] | int) == 8
+        fail_msg: "Unsupported OS. Expect OracleLinux 8.x family."
+
+    # ---------- PRE-CHECK ----------
+    - name: Pre-check insecure dotfiles (group/other permissions)
+      shell: |
+        find /home /root -name ".*" \( -type f -o -type d \) -exec stat -c "%A %n" {} + | \
+        awk '$1 ~ /[rwxs]g|[rwxs]o/ {print $0}' || true
+      register: precheck_dotfiles
+      changed_when: false
+      failed_when: false
+
+    - name: Set pre-check status fact
+      set_fact:
+        insecure_dotfiles: "{{ precheck_dotfiles.stdout_lines | default([]) }}"
+
+    # ---------- ENFORCE ----------
+    - name: Remove group/other access from insecure dotfiles/dirs
+      ansible.builtin.file:
+        path: "{{ item.split(' ', 2)[1] }}"
+        mode: "u=rwX,g=,o="
+      loop: "{{ insecure_dotfiles }}"
+      when: insecure_dotfiles | length > 0
+
+    # ---------- VERIFY ----------
+    - name: Verify remaining insecure dotfiles
+      shell: |
+        find /home /root -name ".*" \( -type f -o -type d \) -exec stat -c "%A %n" {} + | \
+        awk '$1 ~ /[rwxs]g|[rwxs]o/ {print $0}' || true
+      register: verify_dotfiles
+      changed_when: false
+      failed_when: false
+
+    # ---------- RESULT ----------
+    - name: Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "find dotfiles and remove group/other access"
+          expected: "No dotfiles should have group or other permissions"
+          result: "found={{ (precheck_dotfiles.stdout_lines | default([])) | length }}, remaining_insecure={{ (verify_dotfiles.stdout_lines | default([])) | length }}"
+          status: "{{ 'Pass' if (verify_dotfiles.stdout_lines | length) == 0 else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ hostvars[inventory_hostname].ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+    - name: Add host result list to reporting group
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: cis_report
+        result_list: "{{ result_list }}"
+
+# ===== CSV Reporting =====
+- name: Export CIS 6.2.11 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results -%}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_6_2_11_report.csv"

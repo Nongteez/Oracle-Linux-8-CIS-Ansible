@@ -1,0 +1,159 @@
+---
+- name: CIS 1.1.2.3.3 - Ensure /home is mounted with nosuid
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    apply_fixes: false  # เปิดแก้จริงตอนรันด้วย -e apply_fixes=true
+
+  tasks:
+    # ---------- Detect separate /home ----------
+    - name: 1.1.2.3.3 - Get mount TARGET of /home
+      shell: findmnt -nro TARGET /home || true
+      register: home_target
+      changed_when: false
+
+    - name: 1.1.2.3.3 - Determine if /home is a separate mount
+      set_fact:
+        home_is_separate: "{{ (home_target.stdout | trim) == '/home' }}"
+      changed_when: false
+
+    # ---------- Collect mount info when applicable ----------
+    - name: 1.1.2.3.3 - Get /home SOURCE (device)
+      when: home_is_separate
+      shell: findmnt -nro SOURCE /home || true
+      register: home_source
+      changed_when: false
+
+    - name: 1.1.2.3.3 - Get /home FSTYPE
+      when: home_is_separate
+      shell: findmnt -nro FSTYPE /home || true
+      register: home_fstype
+      changed_when: false
+
+    - name: 1.1.2.3.3 - Get /home current OPTIONS
+      when: home_is_separate
+      shell: findmnt -nro OPTIONS /home || true
+      register: home_opts
+      changed_when: false
+
+    - name: 1.1.2.3.3 - Build merged options (keep current + ensure nosuid; remove suid)
+      when: home_is_separate
+      set_fact:
+        optlist: >-
+          {{
+            (
+              (home_opts.stdout | default('') | trim) | length > 0
+            )
+            | ternary((home_opts.stdout | trim | split(',')), [])
+          }}
+        merged_opts: >-
+          {{
+            (optlist | map('trim') | list
+              | union(['nosuid'])
+              | difference(['suid'])
+              | reject('equalto','') | list
+              | join(',')
+            )
+              if (optlist | length) > 0 else 'defaults,nosuid'
+          }}
+
+    # ---------- PERSISTENT (/etc/fstab) ----------
+    - name: 1.1.2.3.3 - Ensure fstab entry has nosuid (persist only)
+      when: home_is_separate and apply_fixes | bool
+      ansible.posix.mount:
+        path: /home
+        src: "{{ home_source.stdout | trim }}"
+        fstype: "{{ (home_fstype.stdout | trim) if (home_fstype.stdout | trim) else 'auto' }}"
+        opts: "{{ merged_opts }}"
+        state: present
+
+    # ---------- RUNTIME (remount only if nosuid is missing) ----------
+    - name: 1.1.2.3.3 - Remount /home with nosuid option only if missing
+      when: >
+        home_is_separate and apply_fixes | bool and
+        ('nosuid' not in (home_opts.stdout | default('')))
+      ansible.posix.mount:
+        path: /home
+        src: "{{ home_source.stdout | trim }}"
+        fstype: "{{ (home_fstype.stdout | trim) if (home_fstype.stdout | trim) else 'auto' }}"
+        opts: "{{ merged_opts }}"
+        state: remounted
+
+    # ---------- VERIFY (เทียบแบบสแกนเนอร์) ----------
+    - name: 1.1.2.3.3 - Verify runtime nosuid (should return nothing)
+      when: home_is_separate
+      shell: "findmnt -nk /home | grep -v nosuid || true"
+      register: check_runtime_nosuid
+      changed_when: false
+
+    - name: 1.1.2.3.3 - Verify fstab nosuid (should return nothing)
+      when: home_is_separate
+      shell: "grep -E '^[^#]+\\s+/home\\s+' /etc/fstab | grep -v nosuid || true"
+      register: check_fstab_nosuid
+      changed_when: false
+
+    # ---------- Compute result/status ----------
+    - name: 1.1.2.3.3 - Compute result/status strings
+      set_fact:
+        result_text: >-
+          {{
+            (
+              '/home is not a separate mount point'
+            ) if (not home_is_separate) else
+            (
+              'runtime_missing=' ~ (((check_runtime_nosuid.stdout | default('')) | length > 0) | string)
+              ~ ', fstab_missing=' ~ (((check_fstab_nosuid.stdout | default('')) | length > 0) | string)
+            )
+          }}
+        status_text: >-
+          {{
+            ('Not Applicable') if (not home_is_separate) else
+            (
+              'Pass'
+              if ((check_runtime_nosuid.stdout | default('')) == '' and
+                  (check_fstab_nosuid.stdout | default('')) == '')
+              else 'Fail'
+            )
+          }}
+
+    - name: 1.1.2.3.3 - Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "1.1.2.3.3"
+          name: "Ensure /home is mounted with nosuid"
+          command: "audit runtime & fstab"
+          expected: "/home should be mounted with 'nosuid'"
+          result: "{{ result_text | replace('\n',' ') | trim }}"
+          status: "{{ status_text | trim }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: 1.1.2.3.3 - Append result to result_list
+      set_fact:
+        result_list: "{{ (result_list | default([])) + [ new_result ] }}"
+
+# ---------- Export CSV (ฟอร์แมตเดิม) ----------
+- name: Export CIS 1.1.2.3.3 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list','defined')
+            | map(attribute='result_list')
+            | list | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_1_1_2_3_3_report.csv"

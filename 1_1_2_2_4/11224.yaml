@@ -1,0 +1,62 @@
+---
+- name: CIS 1.1.2.2.4 - Ensure /dev/shm has noexec,nosuid,nodev
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: 1.1.2.2.4 - Check if /dev/shm is a mount point
+      command: mountpoint -q /dev/shm
+      register: is_devshm_mounted
+      ignore_errors: true
+
+    - name: 1.1.2.2.4 - Ensure /dev/shm is mounted with noexec,nosuid,nodev
+      ansible.posix.mount:
+        path: /dev/shm
+        src: tmpfs
+        fstype: tmpfs
+        opts: defaults,nodev,nosuid,noexec
+        state: mounted
+      when: is_devshm_mounted.rc == 0
+
+    - name: 1.1.2.2.4 - Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "1.1.2.2.4"
+          name: "Ensure /dev/shm is mounted with noexec,nosuid,nodev"
+          command: "mountpoint -q /dev/shm"
+          expected: "/dev/shm should be a mount point and include noexec,nosuid,nodev"
+          result: "{{ is_devshm_mounted.stderr | default(is_devshm_mounted.stdout | default('OK')) }}"
+          status: "{{ 'Pass' if is_devshm_mounted.rc == 0 else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default('N/A') }}"
+
+    - name: 1.1.2.2.4 - Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+# Export CSV 
+- name: Export CIS 1.1.2.2.4 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | replace(',', ';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_1_1_2_2_4_report.csv"

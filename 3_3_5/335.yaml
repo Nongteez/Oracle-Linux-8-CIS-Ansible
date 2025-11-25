@@ -1,0 +1,162 @@
+---
+- name: "CIS 3.3.5 - Disable ICMP redirects (all + default)"
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    ipv4_sysctl_file: "/etc/sysctl.d/60-netipv4_sysctl.conf"
+    ipv6_sysctl_file: "/etc/sysctl.d/60-netipv6_sysctl.conf"
+
+  tasks:
+    - name: "3.3.5 - Disable ICMP redirects - IPv4 (all, default)"
+      ansible.builtin.sysctl:
+        name: "{{ item }}"
+        value: "0"
+        state: present            # equivalent to sysctl_set: true ใน Ansible รุ่นใหม่
+        sysctl_set: true
+        reload: true
+        sysctl_file: "{{ ipv4_sysctl_file }}"
+      loop:
+        - "net.ipv4.conf.all.accept_redirects"
+        - "net.ipv4.conf.default.accept_redirects"
+      when: ansible_system == "Linux"
+      tags: ["cis","net","ipv4","3.3.5"]
+
+    - name: "3.3.5 - Flush IPv4 routes (apply immediately)"
+      ansible.builtin.command: sysctl -w net.ipv4.route.flush=1
+      changed_when: false
+      when: ansible_system == "Linux"
+      tags: ["cis","net","ipv4","3.3.5"]
+
+    # ===== IPv6: ทำเฉพาะเมื่อเปิดใช้งาน =====
+    - name: "3.3.5 - Check if IPv6 is enabled (0 = enabled, 1 = disabled)"
+      ansible.builtin.command: sysctl -n net.ipv6.conf.all.disable_ipv6
+      register: ipv6_state
+      failed_when: false
+      changed_when: false
+      when: ansible_system == "Linux"
+      tags: ["cis","net","ipv6","3.3.5"]
+
+    - name: "3.3.5 - Disable ICMP redirects - IPv6 (all, default)"
+      ansible.builtin.sysctl:
+        name: "{{ item }}"
+        value: "0"
+        state: present
+        sysctl_set: true
+        reload: true
+        sysctl_file: "{{ ipv6_sysctl_file }}"
+      loop:
+        - "net.ipv6.conf.all.accept_redirects"
+        - "net.ipv6.conf.default.accept_redirects"
+      when:
+        - ansible_system == "Linux"
+        - ipv6_state.stdout is defined
+        - ipv6_state.stdout | trim == "0"
+      tags: ["cis","net","ipv6","3.3.5"]
+
+    - name: "3.3.5 - Flush IPv6 routes (apply immediately)"
+      ansible.builtin.command: sysctl -w net.ipv6.route.flush=1
+      changed_when: false
+      when:
+        - ansible_system == "Linux"
+        - ipv6_state.stdout is defined
+        - ipv6_state.stdout | trim == "0"
+      tags: ["cis","net","ipv6","3.3.5"]
+
+    # ===== ตรวจค่าจริงจากระบบและสร้างผลลัพธ์ =====
+    - name: "3.3.5 - Read back current values (IPv4)"
+      ansible.builtin.command: sysctl -n {{ item }}
+      register: ipv4_readback
+      changed_when: false
+      loop:
+        - "net.ipv4.conf.all.accept_redirects"
+        - "net.ipv4.conf.default.accept_redirects"
+      tags: ["report","3.3.5"]
+
+    - name: "3.3.5 - Read back current values (IPv6) when enabled"
+      ansible.builtin.command: sysctl -n {{ item }}
+      register: ipv6_readback
+      changed_when: false
+      loop:
+        - "net.ipv6.conf.all.accept_redirects"
+        - "net.ipv6.conf.default.accept_redirects"
+      when:
+        - ipv6_state.stdout is defined
+        - ipv6_state.stdout | trim == "0"
+      tags: ["report","3.3.5"]
+
+    - name: "3.3.5 - Build human-readable actual_result"
+      ansible.builtin.set_fact:
+        actual_result_text: >-
+          IPv4(all)={{ ipv4_readback.results[0].stdout | default('?') | trim }},
+          IPv4(default)={{ ipv4_readback.results[1].stdout | default('?') | trim }}
+          {% if ipv6_state.stdout is defined and (ipv6_state.stdout | trim) == '0' -%}
+          , IPv6(all)={{ ipv6_readback.results[0].stdout | default('?') | trim }},
+          IPv6(default)={{ ipv6_readback.results[1].stdout | default('?') | trim }}
+          {%- else -%}
+          , IPv6=disabled
+          {%- endif %}
+      tags: ["report","3.3.5"]
+
+    - name: "3.3.5 - Compute status Pass/Fail"
+      ansible.builtin.set_fact:
+        cis335_status: >-
+          {% set v4a = (ipv4_readback.results[0].stdout | default('1') | trim) %}
+          {% set v4d = (ipv4_readback.results[1].stdout | default('1') | trim) %}
+          {% if ipv6_state.stdout is defined and (ipv6_state.stdout | trim) == '0' %}
+            {% set v6a = (ipv6_readback.results[0].stdout | default('1') | trim) %}
+            {% set v6d = (ipv6_readback.results[1].stdout | default('1') | trim) %}
+            {{ 'Pass' if (v4a == '0' and v4d == '0' and v6a == '0' and v6d == '0') else 'Fail' }}
+          {% else %}
+            {{ 'Pass' if (v4a == '0' and v4d == '0') else 'Fail' }}
+          {% endif %}
+      tags: ["report","3.3.5"]
+
+    - name: "3.3.5 - Build result object for CSV"
+      ansible.builtin.set_fact:
+        new_result:
+          control_id: "3.3.5"
+          name: "Disable ICMP redirects (all + default)"
+          command: >-
+            sysctl net.ipv4.conf.all.accept_redirects &&
+            sysctl net.ipv4.conf.default.accept_redirects
+            {% if ipv6_state.stdout is defined and (ipv6_state.stdout | trim) == '0' -%}
+            && sysctl net.ipv6.conf.all.accept_redirects &&
+            sysctl net.ipv6.conf.default.accept_redirects
+            {%- endif %}
+          expected: "All accept_redirects values are 0 (IPv4 and IPv6 if enabled)"
+          result: "{{ actual_result_text }}"
+          status: "{{ cis335_status }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+      tags: ["report","3.3.5"]
+
+    - name: "3.3.5 - Append result to result_list"
+      ansible.builtin.set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+      tags: ["report","3.3.5"]
+
+- name: "Export CIS 3.3.5 Results to CSV"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Combine result_list from all hosts"
+      ansible.builtin.set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: "Export combined result list to CSV (Local)"
+      ansible.builtin.copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results -%}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command | replace('\n',' ') | trim }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor -%}
+        dest: "./cis_3_3_5_report.csv"

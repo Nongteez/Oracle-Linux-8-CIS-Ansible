@@ -1,0 +1,133 @@
+---
+# 5124.yaml
+- name: CIS 5.1.2.4 - Ensure journald log storage is persistent
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "5.1.2.4"
+    control_name: "Ensure journald log storage is persistent"
+    journal_conf: "/etc/systemd/journald.conf"
+    journal_dir: "/var/log/journal"
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Become: {{ ansible_effective_user_id | default('root') }}"
+
+    - name: Guard | Oracle Linux 8 family only
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+          - ansible_facts['distribution'] in ["OracleLinux", "RedHat", "Rocky", "AlmaLinux"]
+          - (ansible_facts['distribution_major_version'] | int) == 8
+        fail_msg: "Unsupported OS. Expect OracleLinux 8.x family."
+
+    # ---------- PRE-CHECK ----------
+    - name: Pre-check Storage=persistent in journald.conf and directory exists
+      shell: |
+        conf_ok="NO"
+        dir_ok="NO"
+        if grep -q '^Storage=persistent' {{ journal_conf }} 2>/dev/null; then conf_ok="YES"; fi
+        if [ -d "{{ journal_dir }}" ]; then dir_ok="YES"; fi
+        echo "conf=${conf_ok} dir=${dir_ok}"
+      register: journald_precheck
+      changed_when: false
+      failed_when: false
+
+    - name: Set pre-check status fact
+      set_fact:
+        persistent_ok: "{{ 'conf=YES' in journald_precheck.stdout and 'dir=YES' in journald_precheck.stdout }}"
+
+    # ---------- ENFORCE ----------
+    - name: Ensure Storage=persistent in journald.conf
+      when: not persistent_ok
+      ansible.builtin.lineinfile:
+        path: "{{ journal_conf }}"
+        regexp: '^#?Storage='
+        line: 'Storage=persistent'
+        state: present
+        create: yes
+      notify: Restart systemd-journald
+
+    - name: Ensure /var/log/journal exists
+      when: not persistent_ok
+      ansible.builtin.file:
+        path: "{{ journal_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    # ---------- VERIFY ----------
+    - name: Verify Storage=persistent and directory exists
+      shell: |
+        conf="$(grep -E '^Storage=persistent' {{ journal_conf }} 2>/dev/null || echo 'Not Found')"
+        dir="$( [ -d "{{ journal_dir }}" ] && echo exists || echo missing )"
+        usage="$(journalctl --disk-usage 2>/dev/null || echo 'N/A')"
+        echo "conf=${conf} dir=${dir} usage=${usage}"
+      register: journald_verify
+      changed_when: false
+      failed_when: false
+
+    # ---------- RESULT ----------
+    - name: Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "Set Storage=persistent in journald.conf + ensure /var/log/journal exists"
+          expected: "Storage=persistent and journald active on disk"
+          result: "{{ journald_verify.stdout }}"
+          status: >-
+            {{
+              'Pass'
+              if 'Storage=persistent' in journald_verify.stdout
+              and 'dir=exists' in journald_verify.stdout
+              and ('Archived and active journals' in journald_verify.stdout)
+              else 'Fail'
+            }}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ hostvars[inventory_hostname].ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+    - name: Add host result list to reporting group
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: cis_report
+        result_list: "{{ result_list }}"
+
+  handlers:
+    - name: Restart systemd-journald
+      service:
+        name: systemd-journald
+        state: restarted
+
+# ===== CSV Reporting =====
+- name: Export CIS 5.1.2.4 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results -%}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_5_1_2_4_report.csv"

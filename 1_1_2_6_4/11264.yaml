@@ -1,0 +1,90 @@
+---
+- name: CIS 1.1.2.6.4 - Ensure noexec option set on /var/log partition
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: 1.1.2.6.4 - Check if /var/log is a mount point
+      command: mountpoint -q /var/log
+      register: is_varlog_mounted
+      ignore_errors: true
+
+    - name: 1.1.2.6.4 - Get mount options of /var/log
+      command: findmnt -no OPTIONS /var/log
+      register: varlog_mount_opts
+      changed_when: false
+      when: is_varlog_mounted.rc == 0
+
+    - name: 1.1.2.6.4 - Get fstype of /var/log
+      set_fact:
+        varlog_fstype: >-
+          {{ ansible_mounts
+              | selectattr('mount', 'equalto', '/var/log')
+              | map(attribute='fstype')
+              | list
+              | first }}
+      when: is_varlog_mounted.rc == 0
+
+    - name: 1.1.2.6.4 - Remount /var/log with noexec if missing
+      ansible.posix.mount:
+        path: /var/log
+        fstype: "{{ varlog_fstype | default('xfs') }}"
+        opts: defaults,noexec
+        state: remounted
+      when:
+        - is_varlog_mounted.rc == 0
+        - "'noexec' not in varlog_mount_opts.stdout"
+        - ansible_system == 'Linux'
+
+    - name: 1.1.2.6.4 - Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "1.1.2.6.4"
+          name: "Ensure noexec option set on /var/log partition"
+          command: "findmnt -no OPTIONS /var/log"
+          expected: "noexec"
+          result: >-
+            {% if is_varlog_mounted.rc != 0 %}
+              /var/log is not a separate mount point
+            {% else %}
+              {{ varlog_mount_opts.stdout }}
+            {% endif %}
+          status: >-
+            {% if is_varlog_mounted.rc != 0 %}
+              Not Applicable
+            {% elif 'noexec' in varlog_mount_opts.stdout %}
+              Pass
+            {% else %}
+              Fail
+            {% endif %}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: 1.1.2.6.4 - Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+- name: Export CIS 1.1.2.6.4 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_1_1_2_6_4_report.csv"

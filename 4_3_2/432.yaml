@@ -1,0 +1,64 @@
+---
+- name: CIS 4.3.2 - Ensure sudo commands use pty
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: 4.3.2 - Enforce use_pty safely via sudoers.d
+      ansible.builtin.lineinfile:
+        path: /etc/sudoers.d/99-use-pty
+        line: 'Defaults use_pty'
+        create: yes
+        mode: '0440'
+        owner: root
+        group: root
+        validate: 'visudo -cf %s'
+      when: ansible_system == 'Linux'
+
+    - name: 4.3.2 - Read use_pty line from /etc/sudoers.d/99-use-pty
+      command: grep '^Defaults use_pty' /etc/sudoers.d/99-use-pty
+      register: sudo_pty_check
+      changed_when: false
+      failed_when: false
+
+    - name: 4.3.2 - Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "4.3.2"
+          name: "Ensure sudo commands use pty"
+          command: "lineinfile /etc/sudoers.d/99-use-pty Defaults use_pty"
+          expected: "Defaults use_pty"
+          result: "{{ sudo_pty_check.stdout | default('Not Found') }}"
+          status: "{{ 'Pass' if 'Defaults use_pty' in sudo_pty_check.stdout else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: 4.3.2 - Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+- name: Export CIS 4.3.2 Results to CSV
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_4_3_2_report.csv"

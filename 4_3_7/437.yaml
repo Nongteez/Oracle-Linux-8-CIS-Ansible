@@ -1,0 +1,393 @@
+---
+- name: CIS 4.3.7 - Ensure access to the su command is restricted (auto-discovery, safe)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "4.3.7"
+    control_name: "Ensure access to the su command is restricted"
+
+    # โหมดทำจริง/ตรวจอย่างเดียว
+    cis_enforce: true
+
+    # กันล็อกระบบ: ถ้าไม่พบ sudoer (non-root) จะไม่แก้ระบบ
+    safety_guard: true
+
+    # อนุญาต override safety guard เมื่อรันด้วย root/sudo session (ปลอดภัยเพราะคุณถือ root อยู่)
+    safety_override_when_root: true
+
+    # กลุ่มว่างสำหรับ CIS
+    su_group: "sugroup"
+    pam_su_file: "/etc/pam.d/su"
+
+    # ตัวเลือกเดิม (เพื่อความเข้ากันได้)
+    status_mode: strict
+    admin_detect_include_interactive: false
+    admin_extra_whitelist: []
+    admin_exclude_users:
+      - nobody
+      - nfsnobody
+
+    # (ทางเลือก) Break-glass: สร้าง sudoer ชั่วคราวอัตโนมัติถ้าไม่มี sudoer
+    breakglass_enable: false
+    breakglass_username: "opsadmin"
+    breakglass_password_hash: ""
+    breakglass_ssh_pubkey: ""
+
+  tasks:
+    # --- ข้อมูลระบบพื้นฐาน ---
+    - name: Stat /etc/pam.d/su (must exist; we won't create a new PAM file)
+      stat:
+        path: "{{ pam_su_file }}"
+      register: su_pam_file
+
+    - name: Get all local usernames (via getent)
+      shell: >-
+        getent passwd | awk -F: '{print $1}'
+      register: all_users
+      changed_when: false
+
+    - name: Build set of all users
+      set_fact:
+        all_user_set: "{{ (all_users.stdout_lines | default([])) | unique }}"
+
+    # --- ดึงสมาชิก wheel/sudo ปัจจุบัน ---
+    - name: Get wheel group members (if exists)
+      command: getent group wheel
+      register: wheel_entry
+      changed_when: false
+      failed_when: false
+
+    - name: Parse wheel group users
+      set_fact:
+        users_wheel: >-
+          {{
+            (wheel_entry.stdout is defined and ':' in wheel_entry.stdout)
+            | ternary(
+                (wheel_entry.stdout.split(':')[-1] | trim).split(',') | reject('equalto','') | list,
+                []
+              )
+            | unique
+          }}
+
+    - name: Get sudo group members (if exists; some distros)
+      command: getent group sudo
+      register: sudo_entry
+      changed_when: false
+      failed_when: false
+
+    - name: Parse sudo group users
+      set_fact:
+        users_sudo: >-
+          {{
+            (sudo_entry.stdout is defined and ':' in sudo_entry.stdout)
+            | ternary(
+                (sudo_entry.stdout.split(':')[-1] | trim).split(',') | reject('equalto','') | list,
+                []
+              )
+            | unique
+          }}
+
+    # --- ดึงผู้ใช้จาก sudoers ตรง ๆ และ User_Alias ---
+    - name: Read sudoers explicit users (username ALL=(...) ALL)
+      shell: >-
+        grep -hE '^[[:alnum:]_.-]+[[:space:]]+ALL=\(.*\)[[:space:]]+ALL' /etc/sudoers /etc/sudoers.d/* 2>/dev/null
+        | awk '{print $1}' | sort -u
+      register: sudoers_direct_users
+      changed_when: false
+      failed_when: false
+
+    - name: Read sudoers User_Alias mappings (raw)
+      shell: >-
+        grep -hE '^User_Alias[[:space:]]+[A-Z0-9_]+[[:space:]]*=' /etc/sudoers /etc/sudoers.d/* 2>/dev/null
+        | sed -E 's/^User_Alias[[:space:]]+([A-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$/\1:\2/'
+        | tr -d ' '
+      register: sudoers_alias_lines
+      changed_when: false
+      failed_when: false
+
+    - name: Have alias lines?
+      set_fact:
+        alias_has_lines: "{{ (sudoers_alias_lines.stdout_lines | default([])) | length > 0 }}"
+
+    - name: Build alias map (name -> users) when we have lines
+      when: alias_has_lines
+      set_fact:
+        alias_map: >-
+          {{
+            dict(
+              (
+                (sudoers_alias_lines.stdout_lines | default([]))
+                | map('split', ':', 1)
+                | map('first')
+                | list
+              )
+              |
+              zip(
+                (sudoers_alias_lines.stdout_lines | default([]))
+                | map('split', ':', 1)
+                | map('last')
+                | map('split', ',')
+              )
+            )
+          }}
+
+    - name: Empty alias map when no lines
+      when: not alias_has_lines
+      set_fact:
+        alias_map: {}
+
+    - name: Extract users from alias map
+      set_fact:
+        users_from_aliases: >-
+          {{
+            alias_map.values()
+            | list
+            | flatten
+            | reject('equalto','')
+            | list
+            | unique
+          }}
+
+    # --- ผู้ใช้ interactive (ตัวเลือก) ---
+    - name: Get interactive users (UID >=1000 with real shells)
+      when: admin_detect_include_interactive | bool
+      shell: >-
+        awk -F: '$3 >= 1000 && $1 != "nobody" && $7 !~ /(nologin|false)$/ {print $1}' /etc/passwd
+      register: interactive_users
+      changed_when: false
+
+    - name: Build interactive user list (or empty)
+      set_fact:
+        users_interactive: >-
+          {{
+            admin_detect_include_interactive
+            | ternary( interactive_users.stdout_lines | default([]), [] )
+          }}
+
+    # --- รวม candidates + override (เพื่อรายงาน/ใช้เป็นตัวชี้วัดว่ามี sudoer ไหม) ---
+    - name: Build base admin candidates (auto-discovered)
+      set_fact:
+        admin_candidates_raw: >-
+          {{
+            (
+              users_wheel
+              + users_sudo
+              + (sudoers_direct_users.stdout_lines | default([]))
+              + users_from_aliases
+              + users_interactive
+              + [ ansible_user_id | default(''), ansible_env.SUDO_USER | default('') ]
+            )
+            | reject('equalto','')
+            | unique
+          }}
+
+    - name: Filter candidates to existing local accounts & apply excludes/includes (step 1)
+      set_fact:
+        admin_candidates: >-
+          {{
+            (admin_candidates_raw
+             | select('in', all_user_set)
+             | reject('in', admin_exclude_users)
+             | list)
+            + admin_extra_whitelist
+          }}
+
+    - name: Unique the admin candidates (step 2)
+      set_fact:
+        admin_candidates_unique: "{{ (admin_candidates | default([])) | unique }}"
+
+    - name: Determine if we have sudo admins (non-root)
+      set_fact:
+        has_sudo_admins: "{{ (admin_candidates_unique | reject('equalto','root') | list | length) > 0 }}"
+
+    # --- (ทางเลือก) Break-glass: สร้าง sudoer ให้เอง ถ้าเปิดใช้งานและยังไม่มี sudoer ---
+    - name: Break-glass | ensure wheel exists and sudo enabled for %wheel
+      when:
+        - breakglass_enable | bool
+        - (not has_sudo_admins | bool)
+        - cis_enforce | bool
+      block:
+        - name: Ensure wheel exists
+          group:
+            name: wheel
+            state: present
+        - name: Ensure %wheel ALL=(ALL) ALL is enabled in /etc/sudoers
+          lineinfile:
+            path: /etc/sudoers
+            regexp: '^\s*%wheel\s+ALL=\(ALL\)\s+ALL'
+            line: '%wheel ALL=(ALL) ALL'
+            state: present
+            validate: 'visudo -cf %s'
+        - name: Create break-glass user
+          user:
+            name: "{{ breakglass_username }}"
+            shell: /bin/bash
+            groups: wheel
+            append: true
+            state: present
+            password: "{{ breakglass_password_hash | default(omit) }}"
+          when:
+            - breakglass_username is defined
+            - breakglass_username | length > 0
+        - name: Authorize SSH key for break-glass user (optional)
+          authorized_key:
+            user: "{{ breakglass_username }}"
+            state: present
+            key: "{{ breakglass_ssh_pubkey }}"
+          when:
+            - breakglass_ssh_pubkey is defined
+            - breakglass_ssh_pubkey | length > 0
+        - name: Refresh sudo admins state after break-glass
+          set_fact:
+            has_sudo_admins: true
+
+    # --- คำนวณ override เมื่อเป็น root/sudo session ---
+    - name: Compute root/sudo session flags for safety override
+      set_fact:
+        is_root_session: "{{ (ansible_user_id | default('')) == 'root' or (ansible_env.SUDO_USER | default('')) != '' }}"
+        safety_override_now: "{{ safety_override_when_root | bool and ( (ansible_user_id | default('')) == 'root' or (ansible_env.SUDO_USER | default('')) != '' ) }}"
+
+    # --- ตัดสินใจ enforce (กันล็อก + ต้องมีไฟล์ PAM) ---
+    - name: Decide if we can safely enforce (with root override)
+      set_fact:
+        enforce_ok: >-
+          {{
+            (cis_enforce | bool)
+            and ( (not (safety_guard | bool)) or (has_sudo_admins | bool) or (safety_override_now | bool) )
+            and (su_pam_file.stat.exists | bool)
+          }}
+
+    # --- Remediation: CIS ของจริง (กลุ่มว่าง + PAM ชี้ group=sugroup) ---
+    - name: Create empty group for su restriction (system group, no members)
+      when: enforce_ok
+      group:
+        name: "{{ su_group }}"
+        state: present
+        system: true
+
+    - name: Comment out other pam_wheel lines (if any) to avoid ambiguity
+      when: enforce_ok
+      replace:
+        path: "{{ pam_su_file }}"
+        regexp: '^\s*auth\s+(required|requisite)\s+pam_wheel\.so(?!.*\buse_uid\b.*\bgroup={{ su_group }}\b).*'
+        replace: '# \g<0>'
+
+    - name: Ensure PAM su uses pam_wheel with use_uid and group={{ su_group }}
+      when: enforce_ok
+      lineinfile:
+        path: "{{ pam_su_file }}"
+        regexp: '^\s*auth\s+(required|requisite)\s+pam_wheel\.so.*$'
+        line: "auth required pam_wheel.so use_uid group={{ su_group }}"
+        insertafter: '^#%PAM-1.0'
+        backup: true
+        create: false
+
+    - name: Ensure {{ su_group }} has no members (must be empty)
+      when: enforce_ok
+      shell: |
+        set -e
+        members="$(getent group {{ su_group }} | awk -F: '{print $4}')"
+        if [ -n "$members" ]; then
+          IFS=',' read -r -a arr <<< "$members"
+          for u in "${arr[@]}"; do
+            gpasswd -d "$u" "{{ su_group }}" >/dev/null || true
+          done
+        fi
+      changed_when: false
+
+    # --- Audit checks ---
+    - name: Check pam_wheel use_uid configured with group={{ su_group }}
+      shell: >-
+        grep -E '^[[:space:]]*auth[[:space:]]+(required|requisite)[[:space:]]+pam_wheel\.so.*\buse_uid\b.*\bgroup={{ su_group }}\b' {{ pam_su_file }}
+      register: pam_wheel_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check {{ su_group }} exists
+      command: getent group {{ su_group }}
+      register: su_group_entry
+      changed_when: false
+      failed_when: false
+
+    - name: Parse {{ su_group }} members
+      set_fact:
+        su_group_members: >-
+          {{
+            (su_group_entry.stdout is defined and ':' in su_group_entry.stdout)
+            | ternary(
+                (su_group_entry.stdout.split(':')[-1] | trim).split(',') | reject('equalto','') | list,
+                []
+              )
+          }}
+
+    - name: Decide status (CIS requires BOTH pam OK AND group empty; guard/override aware)
+      set_fact:
+        status_value: >-
+          {{
+            ((pam_wheel_check.rc == 0) and ((su_group_members | length) == 0))
+            | ternary('Pass',
+                      (not enforce_ok and safety_guard and not has_sudo_admins and not safety_override_now)
+                      | ternary('Fail (safety_guard)', 'Fail'))
+          }}
+
+    # --- Build result for CSV export (ฟอร์แมตเดิม) ---
+    - name: Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "Configure pam_wheel.so use_uid group={{ su_group }}; ensure {{ su_group }} is empty (guard={{ safety_guard }}, root_override={{ safety_override_when_root }}, breakglass={{ breakglass_enable }})"
+          expected: "auth required pam_wheel.so use_uid group={{ su_group }} ; {{ su_group }} has no members"
+          result: >-
+            wheel_members={{ users_wheel | join(';') }};
+            sudo_group={{ users_sudo | join(';') }};
+            sudoers_direct={{ (sudoers_direct_users.stdout_lines | default([])) | join(';') }};
+            alias_users={{ users_from_aliases | join(';') }};
+            interactive_included={{ admin_detect_include_interactive }};
+            discovered_admins={{ admin_candidates_unique | join(';') }};
+            have_admins={{ has_sudo_admins }};
+            pam_su_configured={{ pam_wheel_check.rc == 0 }};
+            pam_file_exists={{ su_pam_file.stat.exists }};
+            group={{ su_group }};
+            group_members={{ su_group_members | join(';') }};
+            group_is_empty={{ (su_group_members | length) == 0 }};
+            safety_guard={{ safety_guard }};
+            root_session={{ is_root_session }};
+            safety_override_now={{ safety_override_now }};
+            breakglass_enabled={{ breakglass_enable }};
+            enforce_ok={{ enforce_ok }};
+            status_mode={{ status_mode }};
+          status: "{{ status_value }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+# --- CSV reporting (สไตล์เดิม) ---
+- name: Export CIS 4.3.7 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_4_3_7_report.csv"

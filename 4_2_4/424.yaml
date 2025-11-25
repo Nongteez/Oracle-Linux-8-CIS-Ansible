@@ -1,0 +1,93 @@
+- name: CIS 4.2.4 - Auto Configure AllowUsers from existing shell users
+  hosts: all
+  become: true
+  gather_facts: false
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+  tasks:
+    - name: Get list of shell-login users
+      ansible.builtin.shell: |
+        awk -F: '($7 ~ /bash|sh|zsh|ksh/) { print $1 }' /etc/passwd
+      register: login_users
+      changed_when: false
+
+    - name: Filter out system users (shutdown, halt, sync)
+      set_fact:
+        login_users_filtered: "{{ login_users.stdout_lines | reject('in', ['shutdown', 'halt', 'sync']) | list }}"
+
+    - name: Abort if no valid shell users found (Prevent lockout)
+      ansible.builtin.fail:
+        msg: "No valid shell users found to configure AllowUsers. Aborting to prevent SSH lockout."
+      when: login_users_filtered | length == 0
+
+    - name: Set fact for allow_users_line
+      set_fact:
+        allow_users_line: "AllowUsers {{ login_users_filtered | unique | join(' ') }}"
+
+    - name: Backup current sshd_config
+      ansible.builtin.copy:
+        src: /etc/ssh/sshd_config
+        dest: /etc/ssh/sshd_config.bak
+        remote_src: true
+        backup: yes
+
+    - name: Set AllowUsers line in sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^AllowUsers'
+        line: "{{ allow_users_line }}"
+        create: yes
+        validate: '/usr/sbin/sshd -T -f %s'
+      notify: Restart sshd
+
+    - name: Read back AllowUsers line
+      ansible.builtin.command: grep '^AllowUsers' /etc/ssh/sshd_config
+      register: sshd_allowusers
+      changed_when: false
+      failed_when: false
+
+    - name: Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "4.2.4"
+          name: "Ensure sshd access is configured (AllowUsers)"
+          command: "Auto generate AllowUsers from shell users"
+          expected: "{{ allow_users_line }}"
+          result: "{{ sshd_allowusers.stdout }}"
+          status: >-
+            {{ 'Pass' if sshd_allowusers.stdout == allow_users_line else 'Fail' }}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+- name: Export CIS 4.2.4 Result
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_4_2_4_report.csv"

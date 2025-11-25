@@ -1,0 +1,159 @@
+---
+- name: CIS 4.5.1.2 - Ensure password expiration is 365 days or less
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "4.5.1.2"
+    control_name: "Ensure password expiration is 365 days or less"
+    max_days: 365
+    cis_enforce: true   # ค่าเริ่มต้น audit-only; จะให้แก้จริงใส่ -e "cis_enforce=true"
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Become: {{ ansible_effective_user_id | default('root') }}"
+
+    - name: Guard | Oracle Linux 8 family only
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+          - ansible_facts['distribution'] in ["OracleLinux", "RedHat", "Rocky", "AlmaLinux"]
+          - (ansible_facts['distribution_major_version'] | int) == 8
+        fail_msg: "Unsupported OS. Expect OracleLinux 8.x family."
+
+    # ---------- AUDIT ----------
+    - name: "4.5.1.2 - Extract login users (UID>=1000, shell != nologin/false)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        awk -F: '$3 >= 1000 && $7 !~ /(nologin|false)/ {print $1}' /etc/passwd | sort -u
+      args: { executable: /bin/bash }
+      register: login_users
+      changed_when: false
+      failed_when: false
+
+    # ---------- ENFORCE (optional) ----------
+    - name: "4.5.1.2 - Set password expiration to {{ max_days }} days for each login user"
+      when:
+        - cis_enforce | bool
+        - (login_users.stdout_lines | default([])) | length > 0
+      ansible.builtin.user:
+        name: "{{ item }}"
+        password_expire_max: "{{ max_days }}"
+      loop: "{{ login_users.stdout_lines | default([]) }}"
+
+    # ---------- VERIFY ----------
+    - name: "4.5.1.2 - Check max password age for login users"
+      ansible.builtin.shell: |
+        set -o pipefail
+        users=$(awk -F: '$3 >= 1000 && $7 !~ /(nologin|false)/ {print $1}' /etc/passwd | sort -u)
+        if [ -z "$users" ]; then
+          echo "NO_USERS"
+          exit 0
+        fi
+        for user in $users; do
+          # ตัวอย่างบรรทัด chage -l: "Maximum number of days between password change : 365"
+          raw=$(chage -l "$user" | awk -F: '/Maximum/ {print $2}' | xargs)
+          if echo "$raw" | grep -Eq '^[0-9]+$'; then
+            echo "$user:$raw"
+          else
+            echo "$user:NONNUM($raw)"
+          fi
+        done
+      args: { executable: /bin/bash }
+      register: passwd_maxage_check
+      changed_when: false
+      failed_when: false
+
+    # ---------- PARSE (safe, no regex pitfalls) ----------
+    - name: "4.5.1.2 - Init parse state"
+      vars:
+        _lines: "{{ passwd_maxage_check.stdout_lines | default([]) }}"
+      set_fact:
+        users_none: "{{ (_lines | length == 1) and (_lines[0] == 'NO_USERS') }}"
+        user_max_map: {}
+        offenders_nonnumeric: []
+        offenders_gtmax: []
+
+    - name: "4.5.1.2 - Build user_max_map from lines (safe split)"
+      when: not users_none
+      vars:
+        _lines: "{{ passwd_maxage_check.stdout_lines | default([]) }}"
+      set_fact:
+        user_max_map: >-
+          {{
+            user_max_map | combine({
+              (item.split(':', 1)[0]): (item.split(':', 1)[1] if (':' in item) else '')
+            })
+          }}
+      loop: "{{ _lines | reject('equalto','NO_USERS') | map('trim') | reject('equalto','') | list }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "4.5.1.2 - Collect offenders (NONNUM and > max_days)"
+      when: not users_none
+      set_fact:
+        offenders_nonnumeric: >-
+          {{ offenders_nonnumeric + ([item.key] if (item.value is string and item.value.startswith('NONNUM')) else []) }}
+        offenders_gtmax: >-
+          {{ offenders_gtmax + ([item.key] if (item.value is string and (item.value | regex_search('^[0-9]+$')) and (item.value | int) > (max_days | int)) else []) }}
+      loop: "{{ user_max_map | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}:{{ item.value }}"
+
+    # ---------- RESULT ----------
+    - name: "4.5.1.2 - Build result for CSV export"
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "user.password_expire_max = {{ max_days }} (for UID>=1000 users)"
+          expected: "All login users must have max age ≤ {{ max_days }}"
+          result: >-
+            {{ (passwd_maxage_check.stdout | default('No users found')) | replace('\n',' ') }};
+            offenders_nonnumeric={{ offenders_nonnumeric | default([]) }};
+            offenders_gtmax={{ offenders_gtmax | default([]) }};
+          status: >-
+            {%- if users_none -%}
+            NotApplicable
+            {%- else -%}
+            {{ 'Pass' if ( (offenders_nonnumeric | length == 0) and (offenders_gtmax | length == 0) ) else 'Fail' }}
+            {%- endif -%}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: "4.5.1.2 - Append result to result_list"
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+    - name: "4.5.1.2 - Add host result list to reporting group"
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: cis_report
+        result_list: "{{ result_list }}"
+
+# ===== CSV Reporting =====
+- name: Export CIS 4.5.1.2 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results -%}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ (r.result | replace('\n',' ') | replace(',', ';')) }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_4_5_1_2_report.csv"

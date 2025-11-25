@@ -1,0 +1,133 @@
+---
+- name: CIS 1.1.2.4.3 - Ensure /var is mounted with nosuid (Remediate + Audit)
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    cis_control_id: "1.1.2.4.3"
+    cis_control_name: "Ensure /var is mounted with nosuid"
+
+  tasks:
+    # ===== Detect =====
+    - name: "{{ cis_control_id }} - Check if /var is a separate mount"
+      command: mountpoint -q /var
+      register: is_var_mounted
+      ignore_errors: true
+      changed_when: false
+
+    - name: "{{ cis_control_id }} - Get SOURCE,FSTYPE,OPTIONS for /var"
+      command: bash -lc "findmnt -nr -o SOURCE,FSTYPE,OPTIONS /var"
+      register: var_findmnt
+      changed_when: false
+      when: is_var_mounted.rc == 0
+
+    - name: "{{ cis_control_id }} - Parse findmnt fields"
+      set_fact:
+        var_src:    "{{ var_findmnt.stdout.split()[0] }}"
+        var_fstype: "{{ var_findmnt.stdout.split()[1] }}"
+        var_opts:   "{{ var_findmnt.stdout.split()[2] }}"
+      when: is_var_mounted.rc == 0
+
+    # ===== Prepare new opts =====
+    - name: "{{ cis_control_id }} - Build new options (ensure nosuid + keep existing)"
+      set_fact:
+        var_opts_new: "{{ (var_opts.split(',') + ['nosuid']) | unique | join(',') }}"
+      when: is_var_mounted.rc == 0
+
+    # ===== Backup fstab before change (only when /var separated) =====
+    - name: "{{ cis_control_id }} - Backup /etc/fstab on remote"
+      copy:
+        src: /etc/fstab
+        dest: /etc/fstab.cis-11243.bak
+        remote_src: true
+        mode: '0644'
+      when: is_var_mounted.rc == 0
+      changed_when: false  # การแบ็คอัพไม่ถือว่าเป็น "แก้ระบบ" ในมุมรีพอร์ต
+
+    # ===== Enforce persistently in /etc/fstab =====
+    - name: "{{ cis_control_id }} - Ensure /var entry in fstab with nosuid"
+      ansible.posix.mount:
+        path: /var
+        src: "{{ var_src }}"
+        fstype: "{{ var_fstype }}"
+        opts: "{{ var_opts_new }}"
+        state: present
+      when: is_var_mounted.rc == 0
+
+    # ===== Apply now (remount) =====
+    - name: "{{ cis_control_id }} - Remount /var with updated options"
+      ansible.posix.mount:
+        path: /var
+        src: "{{ var_src }}"
+        fstype: "{{ var_fstype }}"
+        opts: "{{ var_opts_new }}"
+        state: remounted
+      when: is_var_mounted.rc == 0
+
+    # ===== Verify (CIS audit style) =====
+    # Audit ของ CIS: "findmnt -nk /var | grep -v nosuid" -> ต้องไม่มี output (rc != 0) ถึงจะผ่าน
+    - name: "{{ cis_control_id }} - Verify nosuid on /var (CIS audit)"
+      shell: "findmnt -nk /var | grep -v nosuid"
+      register: check_nosuid_var
+      changed_when: false
+      ignore_errors: true
+      when: is_var_mounted.rc == 0
+
+    # ===== Build result for CSV =====
+    - name: "{{ cis_control_id }} - Build result for CSV export"
+      set_fact:
+        new_result:
+          control_id: "{{ cis_control_id }}"
+          name: "{{ cis_control_name }}"
+          command: "findmnt -nk /var | grep -v nosuid"
+          expected: "/var should be mounted with 'nosuid'"
+          result: >-
+            {% if is_var_mounted.rc != 0 %}
+              /var is not a separate mount point
+            {% elif check_nosuid_var.rc | default(1) != 0 %}
+              nosuid is set correctly
+            {% else %}
+              nosuid not set
+            {% endif %}
+          status: >-
+            {% if is_var_mounted.rc != 0 %}
+              Not Applicable
+            {% elif check_nosuid_var.rc | default(1) != 0 %}
+              Pass
+            {% else %}
+              Fail
+            {% endif %}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default('N/A') }}"
+
+    - name: "{{ cis_control_id }} - Append result to result_list"
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+# =========================
+# CSV Reporting (same format)
+# =========================
+- name: Export CIS 1.1.2.4.3 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_1_1_2_4_3_report.csv"

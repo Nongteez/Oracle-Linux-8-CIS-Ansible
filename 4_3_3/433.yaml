@@ -1,0 +1,87 @@
+---
+- name: CIS 4.3.3 - Ensure sudo log file exists and is configured
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: 4.3.3 - Create sudo log file with secure permissions
+      ansible.builtin.file:
+        path: /var/log/sudo.log
+        state: touch
+        owner: root
+        group: root
+        mode: '0600'
+      when: ansible_system == 'Linux'
+
+    - name: 4.3.3 - Configure sudo to log to /var/log/sudo.log
+      ansible.builtin.lineinfile:
+        path: /etc/sudoers.d/99-sudo-log
+        line: 'Defaults logfile="/var/log/sudo.log"'
+        create: yes
+        mode: '0440'
+        owner: root
+        group: root
+        validate: 'visudo -cf %s'
+      when: ansible_system == 'Linux'
+
+    - name: 4.3.3 - Check if logging line exists in sudoers
+      command: grep '^Defaults logfile="/var/log/sudo.log"' /etc/sudoers.d/99-sudo-log
+      register: sudo_logfile_check
+      changed_when: false
+      failed_when: false
+
+    - name: 4.3.3 - Check sudo log file status
+      stat:
+        path: /var/log/sudo.log
+      register: sudo_logfile_stat
+
+    - name: 4.3.3 - Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "4.3.3"
+          name: "Ensure sudo log file exists"
+          command: "file /var/log/sudo.log + lineinfile /etc/sudoers.d/99-sudo-log"
+          expected: "/var/log/sudo.log exists, mode 0600, logging configured"
+          result: >-
+            log_exists={{ sudo_logfile_stat.stat.exists }},
+            mode={{ sudo_logfile_stat.stat.mode }},
+            logging_line={{ 'Defaults logfile=' in sudo_logfile_check.stdout }}
+          status: >-
+            {{
+              'Pass'
+              if sudo_logfile_stat.stat.exists
+              and sudo_logfile_stat.stat.mode == '0600'
+              and 'Defaults logfile=' in sudo_logfile_check.stdout
+              else 'Fail'
+            }}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: 4.3.3 - Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+- name: Export CIS 4.3.3 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_4_3_3_report.csv"

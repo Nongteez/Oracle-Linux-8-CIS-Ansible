@@ -1,0 +1,118 @@
+---
+- name: CIS 1.1.2.6.3 - Ensure nosuid option set on /var/log partition
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # ถ้าต้องการเพิ่ม nodev/noexec ด้วย ให้เติมในลิสต์นี้ได้
+    force_opts: ['nosuid']
+
+  tasks:
+    - name: 1.1.2.6.3 - Check if /var/log is a mount point
+      command: mountpoint -q /var/log
+      register: is_varlog_mounted
+      changed_when: false
+      failed_when: false
+
+    - name: 1.1.2.6.3 - Get SOURCE,FSTYPE,OPTIONS of /var/log (only if separate)
+      command: bash -lc "findmnt -nro SOURCE,FSTYPE,OPTIONS /var/log"
+      register: varlog_info
+      changed_when: false
+      failed_when: false
+      when: is_varlog_mounted.rc == 0
+
+    - name: 1.1.2.6.3 - Parse SOURCE,FSTYPE,OPTIONS
+      set_fact:
+        varlog_src:   "{{ (varlog_info.stdout | default('')).split()[0] | default('') }}"
+        varlog_fstype: "{{ (varlog_info.stdout | default('')).split()[1] | default('') }}"
+        varlog_opts:  "{{ (varlog_info.stdout | default('')).split()[2] | default('') }}"
+      when: is_varlog_mounted.rc == 0
+
+    - name: 1.1.2.6.3 - Build merged mount options (preserve existing + enforce nosuid)
+      set_fact:
+        varlog_opts_list: >-
+          {{
+            (varlog_opts | default('') | trim | length > 0)
+            | ternary(varlog_opts.split(','), [])
+          }}
+        merged_opts_list: "{{ (varlog_opts_list + force_opts) | unique }}"
+        merged_opts: "{{ merged_opts_list | join(',') }}"
+      when: is_varlog_mounted.rc == 0
+
+    - name: 1.1.2.6.3 - Ensure fstab has nosuid for /var/log and mount it
+      ansible.posix.mount:
+        path: /var/log
+        src: "{{ varlog_src }}"
+        fstype: "{{ varlog_fstype | default('xfs') }}"
+        opts: "{{ merged_opts | default('defaults,nosuid') }}"
+        state: mounted
+      when:
+        - is_varlog_mounted.rc == 0
+        - varlog_src | length > 0
+        - (merged_opts | default('')) | length > 0
+
+    - name: 1.1.2.6.3 - Audit runtime (check nosuid) when separate
+      command: bash -lc "findmnt -nk /var/log | grep -qw nosuid"
+      register: audit_nosuid
+      changed_when: false
+      failed_when: false
+      when: is_varlog_mounted.rc == 0
+
+    - name: 1.1.2.6.3 - Get current OPTIONS for report (separate or not)
+      command: bash -lc "findmnt -no OPTIONS /var/log"
+      register: varlog_mount_opts_for_report
+      changed_when: false
+      failed_when: false
+
+    - name: 1.1.2.6.3 - Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "1.1.2.6.3"
+          name: "Ensure nosuid option set on /var/log partition"
+          command: "findmnt -no OPTIONS /var/log"
+          expected: "nosuid"
+          result: >-
+            {% if is_varlog_mounted.rc != 0 %}
+              /var/log is not a separate mount point
+            {% else %}
+              {{ varlog_mount_opts_for_report.stdout | default('') }}
+            {% endif %}
+          status: >-
+            {% if is_varlog_mounted.rc != 0 %}
+              Not Applicable
+            {% elif (audit_nosuid.rc | default(1)) == 0 %}
+              Pass
+            {% else %}
+              Fail
+            {% endif %}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: 1.1.2.6.3 - Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+- name: Export CIS 1.1.2.6.3 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_1_1_2_6_3_report.csv"

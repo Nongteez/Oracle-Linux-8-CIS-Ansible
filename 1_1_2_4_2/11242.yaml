@@ -1,0 +1,117 @@
+---
+- name: CIS 1.1.2.4.2 - Ensure /var is mounted with nodev
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    cis_control_id: "1.1.2.4.2"
+    cis_name: "Ensure /var is mounted with nodev"
+
+  tasks:
+    - name: "{{ cis_control_id }} - Check if /var is a mount point"
+      command: mountpoint -q /var
+      register: is_var_mounted
+      changed_when: false
+      failed_when: false
+
+    - name: "{{ cis_control_id }} - Collect SOURCE,FSTYPE,OPTIONS for /var (when separate)"
+      command: findmnt -nro SOURCE,FSTYPE,OPTIONS /var
+      register: var_srcfstypeopts
+      changed_when: false
+      when: is_var_mounted.rc == 0
+
+    - name: "{{ cis_control_id }} - Parse device, fstype, opts"
+      set_fact:
+        var_device: "{{ var_srcfstypeopts.stdout.split(' ')[0] }}"
+        var_fstype: "{{ var_srcfstypeopts.stdout.split(' ')[1] }}"
+        var_opts_current: "{{ var_srcfstypeopts.stdout.split(' ')[2] | default('defaults') }}"
+      when: is_var_mounted.rc == 0
+
+    - name: "{{ cis_control_id }} - Merge opts with nodev (preserve existing)"
+      set_fact:
+        var_opts_merged: >-
+          {{
+            (
+              (var_opts_current.split(',') | map('trim') | list) + ['nodev']
+            )
+            | unique
+            | list
+            | join(',')
+          }}
+      when: is_var_mounted.rc == 0
+
+    - name: "{{ cis_control_id }} - Ensure /etc/fstab has /var with nodev (state=present)"
+      ansible.posix.mount:
+        path: /var
+        src: "{{ var_device }}"
+        fstype: "{{ var_fstype }}"
+        opts: "{{ var_opts_merged }}"
+        state: present
+      when: is_var_mounted.rc == 0
+      notify: Remount /var
+
+    - name: "{{ cis_control_id }} - Verify nodev is set on /var (runtime)"
+      shell: "findmnt -nk /var | grep -q '\\bnodev\\b'"
+      register: check_nodev_var
+      changed_when: false
+      failed_when: false
+      when: is_var_mounted.rc == 0
+
+    - name: "{{ cis_control_id }} - Build result for CSV export"
+      set_fact:
+        new_result:
+          control_id: "{{ cis_control_id }}"
+          name: "{{ cis_name }}"
+          command: "findmnt -nk /var | grep -v nodev"
+          expected: "Nothing should be returned"
+          result: >-
+            {% if is_var_mounted.rc != 0 %}
+              /var is not a separate mount point
+            {% elif check_nodev_var.rc == 0 %}
+              nodev is set correctly
+            {% else %}
+              nodev not set
+            {% endif %}
+          status: >-
+            {% if is_var_mounted.rc != 0 %}
+              Not Applicable
+            {% elif check_nodev_var.rc == 0 %}
+              Pass
+            {% else %}
+              Fail
+            {% endif %}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default('N/A') }}"
+    - name: "{{ cis_control_id }} - Append result to result_list"
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+  handlers:
+    - name: Remount /var
+      command: mount -o remount /var
+
+# ---------------- CSV Export ----------------
+- name: Export {{ cis_control_id }} Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_1_1_2_4_2_report.csv"

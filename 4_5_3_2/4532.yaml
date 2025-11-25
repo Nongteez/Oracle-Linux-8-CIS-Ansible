@@ -1,0 +1,119 @@
+- name: CIS 4.5.3.2 - Ensure default user shell timeout is configured (TMOUT <= target)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    control_id: "4.5.3.2"
+    control_name: "Ensure default user shell timeout is configured"
+    tmout_target: 600
+    cis_tmout_file: "/etc/profile.d/99-cis-tmout.sh"
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Become: {{ ansible_effective_user_id | default('root') }}"
+
+    - name: Guard | Oracle Linux 8 family only
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+          - ansible_facts['distribution'] in ["OracleLinux", "RedHat", "Rocky", "AlmaLinux"]
+          - (ansible_facts['distribution_major_version'] | int) == 8
+        fail_msg: "Unsupported OS. Expect OracleLinux 8.x family."
+
+    # ---------- PRE-CHECK ----------
+    - name: Pre-check TMOUT settings in /etc/profile and /etc/profile.d/*.sh
+      shell: |
+        max="$(grep -hE '^[[:space:]]*TMOUT=' /etc/profile /etc/profile.d/*.sh 2>/dev/null | awk -F= '{print $2}' | sort -n | tail -1)"
+        exp="$(grep -hE '^[[:space:]]*export[[:space:]]+TMOUT' /etc/profile /etc/profile.d/*.sh 2>/dev/null | wc -l)"
+        ro="$(grep -hE '^[[:space:]]*readonly[[:space:]]+TMOUT' /etc/profile /etc/profile.d/*.sh 2>/dev/null | wc -l)"
+        if [ "$max" = "{{ tmout_target }}" ] && [ "$exp" -gt 0 ] && [ "$ro" -gt 0 ]; then
+          echo "OK"
+        else
+          echo "NOT_OK"
+        fi
+      register: tmout_precheck
+      changed_when: false
+      failed_when: false
+
+    - name: Set pre-check status fact
+      set_fact:
+        tmout_ok: "{{ tmout_precheck.stdout == 'OK' }}"
+
+    # ---------- ENFORCE (เฉพาะถ้าไม่ OK) ----------
+    - name: Configure TMOUT via /etc/profile.d (interactive shells only)
+      when: not tmout_ok
+      ansible.builtin.blockinfile:
+        path: "{{ cis_tmout_file }}"
+        create: true
+        mode: '0644'
+        backup: true
+        block: |
+          # CIS {{ control_id }} - {{ control_name }}
+          case "$-" in
+            *i*) ;;
+            *) return ;;
+          esac
+          TMOUT={{ tmout_target }}
+          export TMOUT
+          readonly TMOUT
+
+    # ---------- VERIFY ----------
+    - name: Verify TMOUT settings after enforce/audit
+      shell: |
+        max="$(grep -hE '^[[:space:]]*TMOUT=' /etc/profile /etc/profile.d/*.sh 2>/dev/null | awk -F= '{print $2}' | sort -n | tail -1)"
+        exp="$(grep -hE '^[[:space:]]*export[[:space:]]+TMOUT' /etc/profile /etc/profile.d/*.sh 2>/dev/null | wc -l)"
+        ro="$(grep -hE '^[[:space:]]*readonly[[:space:]]+TMOUT' /etc/profile /etc/profile.d/*.sh 2>/dev/null | wc -l)"
+        echo "MAX_TMOUT=${max:-UNSET} export=$([ $exp -gt 0 ] && echo yes || echo no) readonly=$([ $ro -gt 0 ] && echo yes || echo no)"
+      register: tmout_verify
+      changed_when: false
+      failed_when: false
+
+    # ---------- RESULT ----------
+    - name: Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "Check & Configure TMOUT to {{ tmout_target }}"
+          expected: "TMOUT={{ tmout_target }}, export and readonly present"
+          result: "{{ tmout_verify.stdout }}"
+          status: "{{ 'Pass' if tmout_ok or ('MAX_TMOUT=' ~ tmout_target in tmout_verify.stdout and 'export=yes' in tmout_verify.stdout and 'readonly=yes' in tmout_verify.stdout) else 'Fail' }}"
+          host: "{{ inventory_hostname }}"
+          ip: "{{ hostvars[inventory_hostname].ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+    - name: Add host result list to reporting group
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: cis_report
+        result_list: "{{ result_list }}"
+
+# ===== CSV Reporting =====
+- name: Export CIS 4.5.3.2 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results -%}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_4_5_3_2_report.csv"

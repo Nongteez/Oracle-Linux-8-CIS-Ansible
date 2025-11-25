@@ -1,0 +1,176 @@
+---
+- name: CIS 4.1.1.8 - Ensure crontab is restricted to authorized users
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # รายชื่อผู้ใช้ที่อนุญาตให้ใช้ crontab (CIS แนะนำ allowlist)
+    cis_cron_allow_users:
+      - root
+    # นโยบาย: แนะนำลบ cron.deny เพื่อลดความซับซ้อน (CIS อนุญาตให้ไม่มีไฟล์นี้)
+    cis_remove_cron_deny: true
+
+  tasks:
+    # ตรวจว่าระบบมี cron ติดตั้งหรือไม่ (รองรับ RHEL/Oracle = cronie, Debian/Ubuntu = cron)
+    - name: Collect installed packages facts
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Decide if cron is installed
+      ansible.builtin.set_fact:
+        cis_cron_installed: >-
+          {{
+            ('cronie' in ansible_facts.packages) or
+            ('cron'   in ansible_facts.packages)
+          }}
+
+    # -------------------- Remediation (ถ้ามี cron) --------------------
+    - name: Ensure /etc/cron.allow exists with 0640 root:root
+      ansible.builtin.file:
+        path: /etc/cron.allow
+        state: touch
+        mode: '0640'      # CIS: 0640 หรือเข้มงวดกว่าได้
+        owner: root
+        group: root
+      when: cis_cron_installed
+
+    - name: Populate /etc/cron.allow with allowlist users
+      ansible.builtin.copy:
+        dest: /etc/cron.allow
+        owner: root
+        group: root
+        mode: '0640'
+        content: |
+          {% for u in cis_cron_allow_users %}
+          {{ u }}
+          {% endfor %}
+      when: cis_cron_installed
+
+    - name: Remove /etc/cron.deny (recommended)
+      ansible.builtin.file:
+        path: /etc/cron.deny
+        state: absent
+      when: cis_cron_installed and cis_remove_cron_deny
+
+    - name: If keeping /etc/cron.deny, enforce 0640 root:root
+      ansible.builtin.file:
+        path: /etc/cron.deny
+        state: file
+        owner: root
+        group: root
+        mode: '0640'
+      when: cis_cron_installed and not cis_remove_cron_deny
+
+    # -------------------- Audit --------------------
+    - name: Stat /etc/cron.allow
+      ansible.builtin.stat:
+        path: /etc/cron.allow
+      register: cron_allow_stat
+      when: cis_cron_installed
+
+    - name: Stat /etc/cron.deny
+      ansible.builtin.stat:
+        path: /etc/cron.deny
+      register: cron_deny_stat
+      when: cis_cron_installed
+
+    - name: Read /etc/cron.allow content
+      ansible.builtin.command: cat /etc/cron.allow
+      register: cron_allow_content
+      changed_when: false
+      failed_when: false
+      when: cis_cron_installed
+
+    - name: Build audit booleans (octal-safe, CIS rules)
+      ansible.builtin.set_fact:
+        allow_exists: "{{ cron_allow_stat.stat.exists | default(false) }}"
+        allow_owner_ok: "{{ cron_allow_stat.stat.pw_name | default('') == 'root' }}"
+        allow_group_ok: "{{ cron_allow_stat.stat.gr_name | default('') == 'root' }}"
+        allow_mode_ok: "{{ (cron_allow_stat.stat.mode | default('0000')) | int(base=8) <= 416 }}"   # 416(dec) = 0640(oct)
+        allow_has_root: "{{ (cron_allow_content.stdout | default('')) is search('^\\s*root\\s*$', multiline=True) }}"
+        deny_ok: >-
+          {{
+            (not (cron_deny_stat.stat.exists | default(false))) or
+            (
+              (cron_deny_stat.stat.pw_name | default('')) == 'root' and
+              (cron_deny_stat.stat.gr_name | default('')) == 'root' and
+              ((cron_deny_stat.stat.mode | default('0000')) | int(base=8) <= 416)
+            )
+          }}
+      when: cis_cron_installed
+
+    - name: 4.1.1.8 - Build result for CSV export
+      ansible.builtin.set_fact:
+        new_result: >-
+          {{
+            (
+              {
+                'control_id': '4.1.1.8',
+                'name': 'Ensure crontab is restricted to authorized users',
+                'command': 'manage /etc/cron.allow and /etc/cron.deny',
+                'expected': '/etc/cron.allow exists; mode <= 0640; owner=root; group=root; contains root; /etc/cron.deny absent OR (mode <= 0640; owner=root; group=root)',
+                'result': (
+                  cis_cron_installed
+                  | ternary(
+                      'allow: exists=' ~ (allow_exists|string)
+                      ~ ' mode=' ~ (cron_allow_stat.stat.mode | default('N/A'))
+                      ~ ' owner=' ~ (cron_allow_stat.stat.pw_name | default('N/A'))
+                      ~ ' group=' ~ (cron_allow_stat.stat.gr_name | default('N/A'))
+                      ~ ' has_root=' ~ (allow_has_root|string)
+                      ~ ' ; deny: exists=' ~ ((cron_deny_stat.stat.exists | default(false))|string)
+                      ~ ( (cron_deny_stat.stat.exists | default(false))
+                          | ternary(
+                              ' mode=' ~ (cron_deny_stat.stat.mode | default('N/A'))
+                              ~ ' owner=' ~ (cron_deny_stat.stat.pw_name | default('N/A'))
+                              ~ ' group=' ~ (cron_deny_stat.stat.gr_name | default('N/A')),
+                              ''
+                            )
+                        ),
+                      'cron not installed'
+                    )
+                ),
+                'status': (
+                  cis_cron_installed
+                  | ternary(
+                      (
+                        (allow_exists and allow_owner_ok and allow_group_ok and allow_mode_ok and allow_has_root)
+                        and deny_ok
+                      )
+                      | ternary('Pass', 'Fail'),
+                      'Not Applicable'
+                    )
+                ),
+                'host': inventory_hostname,
+                'ip': (ansible_host | default(ansible_default_ipv4.address | default('N/A')))
+              }
+            )
+          }}
+
+    - name: 4.1.1.8 - Append result to result_list
+      ansible.builtin.set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+- name: Export CIS 4.1.1.8 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      ansible.builtin.set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      ansible.builtin.copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results %}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result | default('') | replace('\n',' ') | trim | replace(',',';') }}","{{ r.host }}","{{ r.ip }}","{{ r.status | trim }}"
+          {% endfor %}
+        dest: "./cis_4_1_1_8_report.csv"

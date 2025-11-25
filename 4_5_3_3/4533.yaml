@@ -1,0 +1,239 @@
+- name: CIS 4.5.3.3 - Ensure default user umask is 027 or more restrictive
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    control_id: "4.5.3.3"
+    control_name: "Ensure default user umask is 027 or more restrictive"
+    umask_target: "027"
+    profiled_file: "/etc/profile.d/50-systemwide_umask.sh"
+    files_to_scrub:
+      - /etc/profile
+      - /etc/bashrc
+      # - /etc/bash.bashrc   # Oracle Linux ปกติไม่มี — เราจะเช็คก่อนค่อยแตะ
+
+  # ตัวเลือก: ลด warning interpreter ของ OL8
+  # vars:
+  #   ansible_python_interpreter: /usr/libexec/platform-python
+
+  tasks:
+    - name: Detect current login user
+      debug:
+        msg: "Login as: {{ ansible_user_id }}, Become: {{ ansible_effective_user_id | default('root') }}"
+
+    - name: Guard | Oracle Linux 8 family only
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+          - ansible_facts['distribution'] in ["OracleLinux", "RedHat", "Rocky", "AlmaLinux"]
+          - (ansible_facts['distribution_major_version'] | int) == 8
+        fail_msg: "Unsupported OS. Expect OracleLinux 8.x family."
+
+    # ---------- ENFORCE: ตั้งค่าในจุด priority สูงสุด (/etc/profile.d) ----------
+    - name: Ensure system-wide umask in /etc/profile.d (highest precedence)
+      copy:
+        dest: "{{ profiled_file }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # CIS 4.5.3.3 - System-wide default umask (highest precedence)
+          umask {{ umask_target }}
+
+    # ---------- เช็คไฟล์ที่จะ scrub ว่ามีจริงก่อน ----------
+    - name: Stat candidate scrub files
+      stat:
+        path: "{{ item }}"
+      register: scrub_stats
+      loop: "{{ files_to_scrub + ['/etc/bash.bashrc'] }}"  # เผื่อมีในอนาคต
+
+    - name: Build list of existing scrub files
+      set_fact:
+        existing_scrub_files: >-
+          {{ scrub_stats.results
+             | selectattr('stat.exists','defined')
+             | selectattr('stat.exists')
+             | map(attribute='stat.path')
+             | list }}
+
+    # ---------- SCRUB: ปิดเสียงบรรทัด umask แบบ no-op (: ...) ----------
+    - name: "Comment-out umask in /etc/profile/bashrc family with no-op (keep if/else valid)"
+      lineinfile:
+        path: "{{ item }}"
+        regexp: '^(.*\bumask\s+.*)$'
+        line: ': # (CIS) disabled: \1'
+        backrefs: yes
+      loop: "{{ existing_scrub_files }}"
+      ignore_errors: true
+
+    - name: "Comment-out umask in other /etc/profile.d/*.sh (except our file) with no-op"
+      shell: |
+        shopt -s nullglob
+        for f in /etc/profile.d/*.sh; do
+          [ "$f" = "{{ profiled_file }}" ] && continue
+          sed -ri 's/^[[:space:]]*umask[[:space:]].*$/: # (CIS) disabled &/' "$f"
+        done
+      args: { executable: /bin/bash }
+
+    # ---------- REPAIR: กัน block then/else ว่าง + ซ่อมคอมเมนต์รอบก่อน ----------
+    - name: "Repair previously commented umask lines to no-op form"
+      lineinfile:
+        path: "{{ item }}"
+        regexp: '^\s*#\s*\(CIS\)\s*disabled:\s*(.*)$'
+        line: ': # (CIS) disabled: \1'
+        backrefs: yes
+      loop: "{{ existing_scrub_files }}"
+      ignore_errors: true
+
+    - name: Ensure non-empty then/else blocks in /etc/profile and /etc/bashrc
+      shell: |
+        for f in /etc/profile /etc/bashrc; do
+          [ -f "$f" ] || continue
+          sed -ri '/^[[:space:]]*then[[:space:]]*$/a\  : # (CIS) injected no-op' "$f"
+          sed -ri '/^[[:space:]]*else[[:space:]]*$/a\  : # (CIS) injected no-op' "$f"
+        done
+      args: { executable: /bin/bash }
+
+    # ---------- login.defs & pam_umask ----------
+    - name: Ensure UMASK {{ umask_target }} in /etc/login.defs
+      lineinfile:
+        path: /etc/login.defs
+        regexp: '^\s*UMASK\s+'
+        line: "UMASK {{ umask_target }}"
+        state: present
+
+    - name: Ensure USERGROUPS_ENAB yes in /etc/login.defs
+      lineinfile:
+        path: /etc/login.defs
+        regexp: '^\s*USERGROUPS_ENAB\s+'
+        line: "USERGROUPS_ENAB yes"
+        state: present
+
+    - name: Ensure pam_umask present in /etc/pam.d/postlogin (no explicit umask=)
+      lineinfile:
+        path: /etc/pam.d/postlogin
+        regexp: '^\s*session\s+.*\s+pam_umask\.so'
+        line: 'session    optional     pam_umask.so'
+        insertafter: EOF
+        state: present
+      ignore_errors: true
+
+    - name: Ensure pam_umask present in /etc/pam.d/sshd (affects SSH sessions)
+      lineinfile:
+        path: /etc/pam.d/sshd
+        regexp: '^\s*session\s+.*\s+pam_umask\.so'
+        line: 'session    optional     pam_umask.so'
+        insertafter: EOF
+        state: present
+      ignore_errors: true
+
+    # ---------- VERIFY (system-wide; ไม่อ่าน dotfiles ของ user) ----------
+    - name: Verify default system umask via /etc/profile only (expect 0027)
+      shell: |
+        env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin bash -lc 'source /etc/profile; umask'
+      register: umask_now
+      changed_when: false
+
+    - name: Test default file/dir perms via system profile only (expect file=640, dir=750)
+      shell: |
+        env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin bash -lc '
+          source /etc/profile
+          tmpd="$(mktemp -d)"
+          cd "$tmpd"
+          touch t && mkdir d
+          printf "file=%s dir=%s\n" "$(stat -c "%a" t)" "$(stat -c "%a" d)"
+          cd / && rm -rf "$tmpd"
+        '
+      register: perm_test
+      changed_when: false
+      failed_when: false
+
+    - name: Verify config files states for audit parity
+      shell: |
+        ok_profiled=$(grep -Pq '^\s*umask\s+{{ umask_target }}\b' {{ profiled_file }} && echo yes || echo no)
+        weak_others=$( (grep -n '^[[:space:]]*umask[[:space:]]' /etc/profile /etc/bashrc /etc/bash.bashrc 2>/dev/null || true; \
+                        grep -n '^[[:space:]]*umask[[:space:]]' /etc/profile.d/*.sh 2>/dev/null | grep -v "{{ profiled_file }}" || true) \
+                        | grep -v '(CIS) disabled' | wc -l)
+        login_defs_umask=$(grep -E '^\s*UMASK\s+{{ umask_target }}\b' /etc/login.defs >/dev/null && echo yes || echo no)
+        login_defs_ue=$(grep -E '^\s*USERGROUPS_ENAB\s+yes\b' /etc/login.defs >/dev/null && echo yes || echo no)
+        postlogin_pam=$(grep -Pq '^\s*session\s+.*\s+pam_umask\.so' /etc/pam.d/postlogin 2>/dev/null && echo yes || echo no)
+        sshd_pam=$(grep -Pq '^\s*session\s+.*\s+pam_umask\.so' /etc/pam.d/sshd 2>/dev/null && echo yes || echo no)
+        echo "profiled=$ok_profiled weak_others=$weak_others login_defs_umask=$login_defs_umask login_defs_ue=$login_defs_ue postlogin_pam=$postlogin_pam sshd_pam=$sshd_pam"
+      register: config_verify
+      changed_when: false
+      failed_when: false
+
+    # ใช้เฉพาะดีบัก — ปิดได้ในโปรดักชัน
+    - name: "List any remaining umask lines (debug only)"
+      when: false
+      shell: |
+        (grep -n '^[[:space:]]*umask[[:space:]]' /etc/profile /etc/bashrc /etc/bash.bashrc 2>/dev/null || true)
+        (grep -n '^[[:space:]]*umask[[:space:]]' /etc/profile.d/*.sh 2>/dev/null | grep -v "{{ profiled_file }}" || true)
+      register: umask_left
+      changed_when: false
+      failed_when: false
+
+    # ---------- RESULT ----------
+    - name: Build result for CSV export
+      set_fact:
+        new_result:
+          control_id: "{{ control_id }}"
+          name: "{{ control_name }}"
+          command: "Configure system-wide umask={{ umask_target }} in profile.d; scrub others with no-op; login.defs; pam_umask"
+          expected: "umask 027 active; file=640 dir=750; profiled=ok; no weak umask elsewhere; login.defs ok; pam_umask present"
+          result: >-
+            interactive={{ umask_now.stdout | default('N/A') }}
+            ; perms={{ perm_test.stdout | default('N/A') }}
+            ; {{ config_verify.stdout | default('N/A') }}
+          status: >-
+            {{
+              (
+                (umask_now.stdout | trim) == '0027'
+              ) and
+              ('file=640' in (perm_test.stdout | default(''))) and
+              ('dir=750' in (perm_test.stdout | default(''))) and
+              ('profiled=yes' in (config_verify.stdout | default(''))) and
+              ('weak_others=0' in (config_verify.stdout | default(''))) and
+              ('login_defs_umask=yes' in (config_verify.stdout | default(''))) and
+              ('login_defs_ue=yes' in (config_verify.stdout | default(''))) and
+              ('postlogin_pam=yes' in (config_verify.stdout | default(''))) and
+              ('sshd_pam=yes' in (config_verify.stdout | default('')))
+              | ternary('Pass','Fail')
+            }}
+          host: "{{ inventory_hostname }}"
+          ip: "{{ hostvars[inventory_hostname].ansible_host | default(ansible_default_ipv4.address | default('N/A')) }}"
+
+    - name: Append result to result_list
+      set_fact:
+        result_list: "{{ result_list | default([]) + [ new_result ] }}"
+
+    - name: Add host result list to reporting group
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: cis_report
+        result_list: "{{ result_list }}"
+
+# ===== CSV Reporting =====
+- name: Export CIS 4.5.3.3 Results to CSV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Combine result_list from all hosts
+      set_fact:
+        combined_results: >-
+          {{
+            hostvars.values()
+            | selectattr('result_list', 'defined')
+            | map(attribute='result_list')
+            | list
+            | flatten
+          }}
+
+    - name: Export combined result list to CSV (Local)
+      copy:
+        content: |
+          control_id,cis_name,command,expected_result,actual_result,host,ip,status
+          {% for r in combined_results -%}
+          "{{ r.control_id }}","{{ r.name }}","{{ r.command }}","{{ r.expected }}","{{ r.result }}","{{ r.host }}","{{ r.ip }}","{{ r.status }}"
+          {% endfor %}
+        dest: "./cis_4_5_3_3_report.csv"
